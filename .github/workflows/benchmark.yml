@@ -56,6 +56,4 @@ jobs:
         with:
           name: benchmark-results
           path: |
-            benchmark_output.txt
-            benchmark_results.csv
             performance_plot.png

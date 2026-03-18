@@ -4,9 +4,9 @@
 #define B(i,j) B[(i)+(j)*LDB]
 #define C(i,j) C[(i)+(j)*LDC]
 
-#define MC 80
-#define NC 1800
-#define KC 4072
+#define MC 64
+#define NC 712
+#define KC 2048
 
 #ifndef NTHREADS
     #define NTHREADS 8

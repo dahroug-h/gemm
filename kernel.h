@@ -13,7 +13,7 @@
 #endif
 
 #ifndef OMP_SCHEDULE
-    #define OMP_SCHEDULE static
+    #define OMP_SCHEDULE dynamic
 #endif
 
 #define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(OMP_SCHEDULE) num_threads(NTHREADS)")

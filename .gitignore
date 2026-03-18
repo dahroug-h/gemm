@@ -1,0 +1,12 @@
+# Perf tool output (root-owned, not needed)
+perf.data
+perf.data.old
+
+# Compiled binaries
+matmul
+autotune
+aut
+
+# Optional: keep or exclude these
+performance_plot.png
+benchmark_results.csv

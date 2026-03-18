@@ -1,0 +1,61 @@
+name: Benchmark Matmul
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgomp1 python3-pip libdnnl-dev
+          # Install MKL
+          wget -q https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          echo "deb https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+          sudo apt-get install -y intel-oneapi-mkl-devel
+
+      - name: Install Python packages
+        run: pip3 install matplotlib numpy pandas
+
+      - name: Check CPU features
+        run: |
+          echo "=== CPU Info ==="
+          lscpu | grep -E "Model name|AVX"
+          grep -o 'avx2' /proc/cpuinfo | head -1 && echo "AVX2: YES" || echo "AVX2: NOT FOUND"
+
+      - name: Compile matmul
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          gcc -g -fopenmp matmul.c -O3 -march=native -mavx2 \
+            -I$MKLROOT/include \
+            -L$MKLROOT/lib/intel64 \
+            -lmkl_rt -ldnnl -lpthread -lm -ldl \
+            -o matmul
+
+      - name: Run benchmark
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
+          ./matmul | tee benchmark_output.txt
+
+      - name: Generate performance plot
+        run: python3 plot.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmark_output.txt
+            benchmark_results.csv
+            performance_plot.png

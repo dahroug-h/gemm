@@ -1,0 +1,111 @@
+name: Benchmark Matmul (AVX2 Intel Only)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── 2. Enforce Intel CPU with AVX2 and NO AVX512 ───────────
+      - name: Verify Intel AVX2-only CPU
+        run: |
+          echo "=== Full CPU Info ==="
+          lscpu
+
+          echo ""
+          echo "=== Checking vendor ==="
+          VENDOR=$(lscpu | grep "Vendor ID" | awk '{print $3}')
+          echo "Vendor: $VENDOR"
+
+          echo ""
+          echo "=== Checking flags ==="
+          HAS_AVX2=$(grep -o 'avx2' /proc/cpuinfo | head -1 || true)
+          HAS_AVX512=$(grep -o 'avx512f' /proc/cpuinfo | head -1 || true)
+          HAS_INTEL=$(grep -q "GenuineIntel" /proc/cpuinfo && echo "yes" || echo "no")
+
+          echo "Intel:  $HAS_INTEL"
+          echo "AVX2:   ${HAS_AVX2:-NOT FOUND}"
+          echo "AVX512: ${HAS_AVX512:-NOT FOUND}"
+
+          # Fail if not Intel
+          if [ "$HAS_INTEL" != "yes" ]; then
+            echo "❌ NOT an Intel CPU — got AMD or other. Re-run the workflow."
+            exit 1
+          fi
+
+          # Fail if no AVX2
+          if [ -z "$HAS_AVX2" ]; then
+            echo "❌ AVX2 not available. Re-run the workflow."
+            exit 1
+          fi
+
+          # Fail if AVX512 is present (not a fair comparison target)
+          if [ -n "$HAS_AVX512" ]; then
+            echo "❌ AVX512 detected — not the target architecture. Re-run the workflow."
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ Intel AVX2-only CPU confirmed. Proceeding."
+
+      # ── 3. Install dependencies ────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc libgomp1 python3-pip libdnnl-dev
+
+      # ── 4. Install Intel MKL ───────────────────────────────────
+      - name: Install Intel MKL
+        run: |
+          wget -q https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          echo "deb https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update -qq
+          sudo apt-get install -y intel-oneapi-mkl-devel
+
+      # ── 5. Install Python packages ─────────────────────────────
+      - name: Install Python packages
+        run: pip3 install matplotlib numpy pandas
+
+      # ── 6. Compile ─────────────────────────────────────────────
+      - name: Compile matmul
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          gcc -g -fopenmp matmul.c -O3 -march=native -mavx2 \
+            -I$MKLROOT/include \
+            -L$MKLROOT/lib/intel64 \
+            -lmkl_rt -ldnnl -lpthread -lm -ldl \
+            -o matmul
+          echo "✅ Compilation successful"
+
+      # ── 7. Run benchmark ───────────────────────────────────────
+      - name: Run benchmark
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
+          echo "=== Running on: $(lscpu | grep 'Model name' | awk -F: '{print $2}' | xargs) ==="
+          echo "=== Threads: $(nproc) ==="
+          ./matmul | tee benchmark_output.txt
+
+      # ── 8. Generate plot ───────────────────────────────────────
+      - name: Generate performance plot
+        run: python3 plot.py
+
+      # ── 9. Upload everything ───────────────────────────────────
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-intel-avx2
+          path: |
+            benchmark_output.txt
+            benchmark_results.csv
+            performance_plot.png

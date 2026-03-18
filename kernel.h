@@ -9,11 +9,11 @@
 #define KC 4072
 
 #ifndef NTHREADS
-    #define NTHREADS 4
+    #define NTHREADS 8
 #endif
 
 #ifndef OMP_SCHEDULE
-    #define OMP_SCHEDULE dynamic
+    #define OMP_SCHEDULE auto
 #endif
 
 #define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(OMP_SCHEDULE) num_threads(NTHREADS)")

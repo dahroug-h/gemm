@@ -4,7 +4,9 @@
 #define B(i,j) B[(i)+(j)*LDB]
 #define C(i,j) C[(i)+(j)*LDC]
 
+#ifndef MC
 extern int MC, NC, KC;
+#endif
 
 #ifndef NTHREADS
     #define NTHREADS 8
@@ -16,8 +18,8 @@ extern int MC, NC, KC;
 
 #define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(OMP_SCHEDULE) num_threads(NTHREADS)")
 
-#define MC_PADDED (((MC + 5) / 6) * 6)
-#define NC_PADDED (((NC + 15) / 16) * 16)
+#define MC_PADDED(mc) (((mc + 5) / 6) * 6)
+#define NC_PADDED(nc) (((nc + 15) / 16) * 16)
 
 #define min(a,b) (((a)<(b))?(a):(b))
 
@@ -55,8 +57,8 @@ extern int MC, NC, KC;
     k += 4; 
 
 
-static int8_t Buffer_A[(MC_PADDED+6) * KC] __attribute__((aligned(64)));
-static int8_t Buffer_B[(NC_PADDED+16) * KC] __attribute__((aligned(64)));
+#static int8_t Buffer_A[(MC_PADDED+6) * KC] __attribute__((aligned(64)));
+#static int8_t Buffer_B[(NC_PADDED+16) * KC] __attribute__((aligned(64)));
 
 void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc, int row_start, int col_start, int LDA) {
     for (int i = 0; i < mc; i += 6) {
@@ -146,8 +148,8 @@ void kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int LDA, int8_t* B, int 
 
     int32_t* B_col_correction = (int32_t*)malloc(N_safe * sizeof(int32_t));
     
-    int8_t* Local_Buffer_A = (int8_t*)_mm_malloc((MC_PADDED + 6) * KC, 64);
-    int8_t* Local_Buffer_B = (int8_t*)_mm_malloc((NC_PADDED + 16) * KC, 64);
+    int8_t* Local_Buffer_A = (int8_t*)_mm_malloc((MC_PADDED(MC) + 6) * KC, 64);
+    int8_t* Local_Buffer_B = (int8_t*)_mm_malloc((NC_PADDED(NC) + 16) * KC, 64);
     
     if (!Local_Buffer_A || !Local_Buffer_B || !B_col_correction) return;
     for (int j = 0; j < N; j += NC) {

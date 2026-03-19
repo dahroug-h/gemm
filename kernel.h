@@ -5,7 +5,7 @@
 #define C(i,j) C[(i)+(j)*LDC]
 
 #ifndef MC
-extern int MC, NC, KC;
+extern __thread int MC, NC, KC;
 #endif
 
 #ifndef NTHREADS

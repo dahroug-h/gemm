@@ -14,7 +14,24 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ── 2. Print CPU info (informational only, no gating) ─────
+      # ── 2. Cache apt packages ──────────────────────────────────
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/benchmark.yml') }}
+          restore-keys: apt-${{ runner.os }}-
+
+      # ── 3. Cache Intel MKL (biggest time saver ~4 min → 30s) ──
+      - name: Cache Intel MKL
+        id: cache-mkl
+        uses: actions/cache@v4
+        with:
+          path: /opt/intel/oneapi
+          key: mkl-oneapi-ubuntu22-2024
+          restore-keys: mkl-oneapi-ubuntu22-
+
+      # ── 4. Print CPU info ──────────────────────────────────────
       - name: Print CPU info
         run: |
           echo "=== CPU Model ==="
@@ -31,29 +48,36 @@ jobs:
           echo ""
           echo "NOTE: kernel and oneDNN both restricted to AVX2."
 
-      # ── 3. Install system dependencies ────────────────────────
+      # ── 5. Install system dependencies ────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y gcc libgomp1 python3-pip libdnnl-dev
 
-      # ── 4. Install Intel MKL ───────────────────────────────────
+      # ── 6. Install Intel MKL (skipped if cached) ───────────────
       - name: Install Intel MKL
+        if: steps.cache-mkl.outputs.cache-hit != 'true'
         run: |
+          echo "MKL not cached — installing..."
           wget -q https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
           sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
           echo "deb https://apt.repos.intel.com/oneapi all main" \
             | sudo tee /etc/apt/sources.list.d/oneAPI.list
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
+          echo "✅ MKL installed"
 
-      # ── 5. Install Python packages ─────────────────────────────
+      - name: Setup MKL (always needed even when cached)
+        run: |
+          echo "✅ MKL ready at /opt/intel/oneapi"
+          ls /opt/intel/oneapi/setvars.sh
+
+      # ── 7. Install Python packages ─────────────────────────────
       - name: Install Python packages
         run: pip3 install matplotlib numpy pandas
 
-      # ── 6. Build autotuner ─────────────────────────────────────
-      #    autotune.c includes kernel.h directly and runs it
-      #    in-process — must use same AVX2 flags as the kernel.
+      # ── 8. Build autotuner ─────────────────────────────────────
+      #    autotune.c includes kernel.h directly — needs AVX2 flags.
       - name: Build autotuner
         run: |
           gcc autotune.c \
@@ -62,27 +86,24 @@ jobs:
             -o autotune -lm -lpthread
           echo "✅ autotune compiled"
 
-      # ── 7. Run autotuner (~2 min) ──────────────────────────────
-      #    No recompilation — all combos run in one process.
-      #    Writes best params to /tmp/autotune_result.txt as:
-      #      MC NC KC
+      # ── 9. Run autotuner ───────────────────────────────────────
+      #    Parallel in-process — no recompilation per combo.
+      #    Writes best MC/NC/KC to /tmp/autotune_result.txt
       - name: Run autotuner
         run: |
-          echo "Starting in-process autotune (~2 min)..."
+          echo "Starting parallel in-process autotune..."
           ./autotune 2>&1 | tee autotune_log.txt
           echo ""
           echo "=== Autotune result ==="
           cat /tmp/autotune_result.txt
-          # Export to env for next step
           read BEST_MC BEST_NC BEST_KC < /tmp/autotune_result.txt
           echo "BEST_MC=$BEST_MC" >> $GITHUB_ENV
           echo "BEST_NC=$BEST_NC" >> $GITHUB_ENV
           echo "BEST_KC=$BEST_KC" >> $GITHUB_ENV
 
-      # ── 8. Compile matmul ──────────────────────────────────────
-      #    Pass MC/NC/KC as -D flags at compile time.
-      #    kernel.h uses #ifndef MC guard so -DMC=X overrides
-      #    the extern declaration — clean, no sed patching needed.
+      # ── 10. Compile matmul ─────────────────────────────────────
+      #    -DMC/NC/KC passes autotuned values at compile time.
+      #    -march=core-avx2 -mno-avx512f = AVX2-only on any CPU.
       - name: Compile matmul
         run: |
           source /opt/intel/oneapi/setvars.sh
@@ -96,8 +117,8 @@ jobs:
             -o matmul
           echo "✅ matmul compiled (AVX2-only)"
 
-      # ── 9. Run benchmark ───────────────────────────────────────
-      #    DNNL_MAX_CPU_ISA=AVX2 caps oneDNN to AVX2 as well.
+      # ── 11. Run benchmark ──────────────────────────────────────
+      #    DNNL_MAX_CPU_ISA=AVX2 caps oneDNN to AVX2.
       #    Both sides strictly AVX2 — fair on any CPU.
       - name: Run benchmark
         run: |
@@ -111,11 +132,11 @@ jobs:
           echo ""
           ./matmul | tee benchmark_output.txt
 
-      # ── 10. Generate plot ──────────────────────────────────────
+      # ── 12. Generate plot ──────────────────────────────────────
       - name: Generate performance plot
         run: python3 plot.py
 
-      # ── 11. Upload all artifacts ───────────────────────────────
+      # ── 13. Upload all artifacts ───────────────────────────────
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:

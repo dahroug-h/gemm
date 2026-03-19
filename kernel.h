@@ -60,10 +60,6 @@ extern __thread int MC, NC, KC;
     pa += 24; \
     k += 4; 
 
-
-/*static int8_t Buffer_A[(MC_PADDED+6) * KC] __attribute__((aligned(64)));
-#static int8_t Buffer_B[(NC_PADDED+16) * KC] __attribute__((aligned(64)));*/
-
 void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc, int row_start, int col_start, int LDA) {
     for (int i = 0; i < mc; i += 6) {
         int mr = min(6, mc - i);
@@ -142,11 +138,9 @@ void macro_kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int8_t* B, int32_t
     }
 }
 
+
 void kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int LDA, int8_t* B, int LDB, int32_t* C, int LDC) {
     
-
- 
-
     int N_safe = ((N + 15) / 16) * 16;
     
 

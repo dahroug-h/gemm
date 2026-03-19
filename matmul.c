@@ -49,6 +49,14 @@ bool Check_matrix(int32_t *A, int32_t *B, int n){
     }
     return true;
 }
+void flush_cache() {
+    // allocate and touch a buffer larger than L3 (your L3 = 8MB)
+    size_t flush_size = 32 * 1024 * 1024; // 32MB > L3
+    volatile char* buf = (char*)malloc(flush_size);
+    for (size_t i = 0; i < flush_size; i += 64)
+        buf[i] = i;
+    free((void*)buf);
+}
 
 void main(int LDB,int LDC,int LDA) {
     
@@ -56,7 +64,7 @@ void main(int LDB,int LDC,int LDA) {
     FILE *fp = fopen("benchmark_results.csv", "w");
 fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
 
-    for (int i = 100; i <= 4000; i+=100) { 
+    for (int i = 100; i <= 4000; i += 100) {
         
         int m = i, n = i, k = i;
         int8_t ao = 0, bo = 0;
@@ -73,9 +81,11 @@ fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
     memset(C_naive, 0, m * n * sizeof(int32_t));
     memset(C_kernel, 0, m * n * sizeof(int32_t));
 
+    dnnl_gemm_s8s8s32('N','N','F', m,n,k, 1.0f, A,m,ao, B,k,bo, 0.0f, C_dnnl,m,&oc);
+   
+
     clock_t start_dnnl = clock();
 
-  
 
     dnnl_status_t status = dnnl_gemm_s8s8s32(
     'N', 'N', 'F',//transA, transB, offsetC
@@ -89,7 +99,12 @@ fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
     //naive_matmul(A, B, C_naive, m, n, k);
     clock_t end_dnnl = clock();
 
+    int32_t* C_warmup = (int32_t*)calloc(m*n, sizeof(int32_t));
+    kernel(m,n,k, A,m, B,k, C_warmup,m);
+    free(C_warmup);
+
     clock_t start_kernel = clock();
+
 
     kernel(m, n, k, A, m, B, k, C_kernel, m);
 

@@ -1,4 +1,4 @@
-name: Benchmark Matmul (Autotune + Any CPU)
+name: Benchmark Matmul (AVX2-only, Any CPU)
 
 on:
   push:
@@ -14,7 +14,10 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ── 2. Print full CPU info ─────────────────────────────────
+      # ── 2. Print CPU info (informational only, no gating) ─────
+      #    No CPU rejection — -march=core-avx2 -mno-avx512f locks
+      #    the binary to AVX2 on any machine. DNNL_MAX_CPU_ISA=AVX2
+      #    caps oneDNN too. Both sides identical — fair everywhere.
       - name: Print CPU info
         run: |
           echo "=== CPU Model ==="
@@ -26,17 +29,10 @@ jobs:
           echo "=== Cores / Threads ==="
           lscpu | grep -E "^CPU\(s\)|Thread|Core"
           echo ""
-          echo "=== AVX flags ==="
+          echo "=== AVX flags present ==="
           grep -o 'avx[^ ]*' /proc/cpuinfo | sort -u | head -20
           echo ""
-          echo "=== AVX2 check ==="
-          grep -o 'avx2' /proc/cpuinfo | head -1 \
-            && echo "AVX2: YES" || echo "AVX2: NOT FOUND"
-          echo ""
-          echo "=== AVX512 check ==="
-          grep -o 'avx512f' /proc/cpuinfo | head -1 \
-            && echo "AVX512: present (will compile AVX2-only anyway)" \
-            || echo "AVX512: not present — pure AVX2 machine"
+          echo "NOTE: kernel and oneDNN both restricted to AVX2."
 
       # ── 3. Install system dependencies ────────────────────────
       - name: Install system dependencies
@@ -58,77 +54,72 @@ jobs:
       - name: Install Python packages
         run: pip3 install matplotlib numpy pandas
 
-      # ── 6. Build autotuner ────────────────────────────────────
+      # ── 6. Build autotuner ─────────────────────────────────────
       - name: Build autotuner
         run: |
           gcc autotune.c -O2 -o autotune -lm
           echo "✅ autotune compiled"
 
-      # ── 7. Run autotuner → get best MC/NC/KC for THIS machine ─
-      #    This is the key step: it benchmarks across sizes
-      #    256, 512, 1024, 2048, 3072, 4000 and picks the blocking
-      #    parameters with the best harmonic-mean GOPS score.
-      #    Results are written to /tmp/autotune_result.txt as:
-      #       <MC> <NC> <KC>
+      # ── 7. Run autotuner (two-phase, ~5 min) ──────────────────
+      #    Phase 1: coarse grid ~80 combos at N=1024 only (fast)
+      #    Phase 2: fine ±2 steps around winner, harmonic mean
+      #             across 6 sizes — ~125 combos max
+      #    Total: ~200 combos, fits well within GitHub time limits
       - name: Run autotuner
         run: |
-          echo "Starting autotune — this takes a few minutes..."
+          echo "Starting two-phase autotune..."
           ./autotune 2>&1 | tee autotune_log.txt
           echo ""
           echo "=== Autotune result ==="
           cat /tmp/autotune_result.txt
 
-      # ── 8. Patch kernel.h with the new MC/NC/KC ───────────────
-      #    Reads the three values from /tmp/autotune_result.txt
-      #    and does an in-place sed replacement of the #define lines
-      #    in kernel.h so matmul.c picks them up automatically.
+      # ── 8. Patch kernel.h with best MC/NC/KC ──────────────────
       - name: Patch kernel.h with best blocking parameters
         run: |
           read BEST_MC BEST_NC BEST_KC < /tmp/autotune_result.txt
 
           echo "Patching kernel.h:"
-          echo "  MC = $BEST_MC"
-          echo "  NC = $BEST_NC"
-          echo "  KC = $BEST_KC"
+          echo "  MC = $BEST_MC  NC = $BEST_NC  KC = $BEST_KC"
 
-          # Show old values
           echo ""
-          echo "=== kernel.h BEFORE patch ==="
+          echo "=== kernel.h BEFORE ==="
           grep -E "^#define (MC|NC|KC)" kernel.h
 
-          # Patch — handles any existing value after the define
           sed -i "s/^#define MC[[:space:]].*/#define MC  $BEST_MC/" kernel.h
           sed -i "s/^#define NC[[:space:]].*/#define NC  $BEST_NC/" kernel.h
           sed -i "s/^#define KC[[:space:]].*/#define KC  $BEST_KC/" kernel.h
 
-          # Verify
           echo ""
-          echo "=== kernel.h AFTER patch ==="
+          echo "=== kernel.h AFTER ==="
           grep -E "^#define (MC|NC|KC)" kernel.h
           echo "✅ kernel.h patched"
 
-      # ── 9. Compile matmul with patched kernel.h ───────────────
-      #    Use -mavx2 -mno-avx512f so even if the runner has AVX512
-      #    the binary is AVX2-only — same instruction set as your
-      #    i5-10300H. Fair comparison against oneDNN on any machine.
+      # ── 9. Compile matmul ──────────────────────────────────────
+      #    -march=core-avx2 -mno-avx512f = AVX2-only regardless
+      #    of what the CPU supports. No -march=native.
       - name: Compile matmul
         run: |
           source /opt/intel/oneapi/setvars.sh
           gcc -g -fopenmp matmul.c \
-            -O3 -mavx2 -mno-avx512f \
+            -O3 -march=core-avx2 -mavx2 -mno-avx512f \
             -I$MKLROOT/include \
             -L$MKLROOT/lib/intel64 \
             -lmkl_rt -ldnnl -lpthread -lm -ldl \
             -o matmul
-          echo "✅ matmul compiled"
+          echo "✅ matmul compiled (AVX2-only)"
 
       # ── 10. Run benchmark ──────────────────────────────────────
+      #    DNNL_MAX_CPU_ISA=AVX2 caps oneDNN to AVX2 as well.
+      #    Both sides strictly AVX2 — fair on any CPU.
       - name: Run benchmark
         run: |
           source /opt/intel/oneapi/setvars.sh
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
-          echo "=== Running on: $(lscpu | grep 'Model name' | awk -F: '{print $2}' | xargs) ==="
-          echo "=== Threads available: $(nproc) ==="
+          export DNNL_MAX_CPU_ISA=AVX2
+          echo "=== Machine ==="
+          lscpu | grep "Model name"
+          echo "=== $(nproc) logical CPUs available ==="
+          echo "=== Both kernel and oneDNN: AVX2-only ==="
           echo ""
           ./matmul | tee benchmark_output.txt
 
@@ -136,11 +127,11 @@ jobs:
       - name: Generate performance plot
         run: python3 plot.py
 
-      # ── 12. Upload everything ──────────────────────────────────
+      # ── 12. Upload all artifacts ───────────────────────────────
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results-autotuned
+          name: benchmark-results-avx2-only
           path: |
             autotune_log.txt
             benchmark_output.txt

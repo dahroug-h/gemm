@@ -64,7 +64,7 @@ void main(int LDB,int LDC,int LDA) {
     FILE *fp = fopen("benchmark_results.csv", "w");
 fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
 
-    for (int i = 100; i <= 4000; i += 100) {
+    for (int i = 100; i <= 800; i += 100) {
         
         int m = i, n = i, k = i;
         int8_t ao = 0, bo = 0;

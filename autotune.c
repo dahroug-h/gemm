@@ -44,8 +44,8 @@ __thread int NC = 1800;
 __thread int KC = 4072;
 
 /* ── must match kernel.h register tile ── */
-#define MR 8
-#define NR 8
+#define MR 6
+#define NR 16
 
 /* ── include kernel — uses thread-local MC/NC/KC ── */
 #undef min

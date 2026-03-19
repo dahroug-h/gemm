@@ -57,8 +57,8 @@ extern int MC, NC, KC;
     k += 4; 
 
 
-#static int8_t Buffer_A[(MC_PADDED+6) * KC] __attribute__((aligned(64)));
-#static int8_t Buffer_B[(NC_PADDED+16) * KC] __attribute__((aligned(64)));
+/*static int8_t Buffer_A[(MC_PADDED+6) * KC] __attribute__((aligned(64)));
+#static int8_t Buffer_B[(NC_PADDED+16) * KC] __attribute__((aligned(64)));*/
 
 void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc, int row_start, int col_start, int LDA) {
     for (int i = 0; i < mc; i += 6) {

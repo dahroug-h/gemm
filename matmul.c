@@ -11,7 +11,11 @@
 #include <string.h>
 #include <omp.h>
 
-
+static inline uint64_t timer() {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ULL + t.tv_nsec;
+}
 static double median5(double *t) {
     double a[5];
     for (int i = 0; i < 5; i++) a[i] = t[i];
@@ -95,42 +99,33 @@ fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
     memset(C_naive, 0, m * n * sizeof(int32_t));
     memset(C_kernel, 0, m * n * sizeof(int32_t));
 
-/* oneDNN warmup */
-    memset(C_dnnl, 0, m * n * sizeof(int32_t));
     dnnl_gemm_s8s8s32('N','N','F', m,n,k, 1.0f, A,m,ao, B,k,bo, 0.0f, C_dnnl,m,&oc);
 
-    // adaptive reps — ensures total time > 10ms regardless of size
-int reps = (int)(0.01 / (2.0*m*n*k / 288e9)) + 1;  // target 10ms
-if (reps < 3)   reps = 3;
-if (reps > 500) reps = 500;
-
-// oneDNN
-struct timespec t0, t1;
-clock_gettime(CLOCK_MONOTONIC, &t0);
-for (int r = 0; r < reps; r++) {
+    int n_iter = 15;  
     memset(C_dnnl, 0, m*n*sizeof(int32_t));
+
+    uint64_t start_dnnl = timer();
+    for (int j = 0; j < n_iter; j++) {
     dnnl_gemm_s8s8s32('N','N','F', m,n,k,1.0f,A,m,ao,B,k,bo,0.0f,C_dnnl,m,&oc);
-}
-clock_gettime(CLOCK_MONOTONIC, &t1);
-double time_dnnl = ((t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9) / reps;
+    }
+    uint64_t end_dnnl = timer();  
+
+    double time_dnnl = (end_dnnl - start_dnnl) * 1e-9 / n_iter;
 
 
-    /* kernel warmup */
     int32_t* C_warmup = (int32_t*)calloc(m * n, sizeof(int32_t));
     kernel(m, n, k, A, m, B, k, C_warmup, m);
     free(C_warmup);
 
-       
-// kernel — accumulates so zero C each time
-clock_gettime(CLOCK_MONOTONIC, &t0);
-for (int r = 0; r < reps; r++) {
     memset(C_kernel, 0, m*n*sizeof(int32_t));
-    kernel(m, n, k, A, m, B, k, C_kernel, m);
-}
-clock_gettime(CLOCK_MONOTONIC, &t1);
-double time_kernel = ((t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9) / reps;
 
-    /* correctness */
+    uint64_t start_kernel = timer();
+    for (int j = 0; j < n_iter; j++) {
+    kernel(m, n, k, A, m, B, k, C_kernel, m);
+    }
+    uint64_t end_kernel = timer();
+    double time_kernel = (end_kernel - start_kernel) * 1e-9 / n_iter;
+
     memset(C_dnnl,   0, m * n * sizeof(int32_t));
     memset(C_kernel, 0, m * n * sizeof(int32_t));
     dnnl_gemm_s8s8s32('N','N','F', m,n,k, 1.0f, A,m,ao, B,k,bo, 0.0f, C_dnnl,m,&oc);

@@ -116,10 +116,26 @@ void macro_kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int8_t* B, int32_t
     int8_t* pa = A; 
     int8_t* pb = B;
     int K_padded = (K + 3) & ~3;
-    for (int j = 0; j < 16; j++) {
+    /*for (int j = 0; j < 16; j++) {
         _mm_prefetch((const char*)&C[j * LDC], _MM_HINT_T0);
-    }
-    for (k = 0; k < K_padded; ) {
+    }*/
+
+/*
+int l = 0;
+for (; l <= K_padded - 4; l += 4) {
+    { micro_kernel_6x16 }
+    { micro_kernel_6x16 }
+    { micro_kernel_6x16 }
+    { micro_kernel_6x16 }
+}
+int remainder = K_padded - l;
+switch (remainder) {
+    case 3: { micro_kernel_6x16 } [[fallthrough]]; 
+    case 2: { micro_kernel_6x16 } [[fallthrough]];
+    case 1: { micro_kernel_6x16 } break;
+    default: break;
+}*/
+   for (k = 0; k < K_padded; ) {    
         micro_kernel_6x16
     }
 

@@ -15,9 +15,6 @@ jobs:
         uses: actions/checkout@v4
 
       # ── 2. Print CPU info (informational only, no gating) ─────
-      #    No CPU rejection — -march=core-avx2 -mno-avx512f locks
-      #    the binary to AVX2 on any machine. DNNL_MAX_CPU_ISA=AVX2
-      #    caps oneDNN too. Both sides identical — fair everywhere.
       - name: Print CPU info
         run: |
           echo "=== CPU Model ==="
@@ -55,60 +52,51 @@ jobs:
         run: pip3 install matplotlib numpy pandas
 
       # ── 6. Build autotuner ─────────────────────────────────────
+      #    autotune.c includes kernel.h directly and runs it
+      #    in-process — must use same AVX2 flags as the kernel.
       - name: Build autotuner
         run: |
-          gcc autotune.c -O2 -o autotune -lm
+          gcc autotune.c \
+            -O3 -march=core-avx2 -mavx2 -mno-avx512f \
+            -fopenmp \
+            -o autotune -lm -lpthread
           echo "✅ autotune compiled"
 
-      # ── 7. Run autotuner (two-phase, ~5 min) ──────────────────
-      #    Phase 1: coarse grid ~80 combos at N=1024 only (fast)
-      #    Phase 2: fine ±2 steps around winner, harmonic mean
-      #             across 6 sizes — ~125 combos max
-      #    Total: ~200 combos, fits well within GitHub time limits
+      # ── 7. Run autotuner (~2 min) ──────────────────────────────
+      #    No recompilation — all combos run in one process.
+      #    Writes best params to /tmp/autotune_result.txt as:
+      #      MC NC KC
       - name: Run autotuner
         run: |
-          echo "Starting two-phase autotune..."
+          echo "Starting in-process autotune (~2 min)..."
           ./autotune 2>&1 | tee autotune_log.txt
           echo ""
           echo "=== Autotune result ==="
           cat /tmp/autotune_result.txt
-
-      # ── 8. Patch kernel.h with best MC/NC/KC ──────────────────
-      - name: Patch kernel.h with best blocking parameters
-        run: |
+          # Export to env for next step
           read BEST_MC BEST_NC BEST_KC < /tmp/autotune_result.txt
+          echo "BEST_MC=$BEST_MC" >> $GITHUB_ENV
+          echo "BEST_NC=$BEST_NC" >> $GITHUB_ENV
+          echo "BEST_KC=$BEST_KC" >> $GITHUB_ENV
 
-          echo "Patching kernel.h:"
-          echo "  MC = $BEST_MC  NC = $BEST_NC  KC = $BEST_KC"
-
-          echo ""
-          echo "=== kernel.h BEFORE ==="
-          grep -E "^#define (MC|NC|KC)" kernel.h
-
-          sed -i "s/^#define MC[[:space:]].*/#define MC  $BEST_MC/" kernel.h
-          sed -i "s/^#define NC[[:space:]].*/#define NC  $BEST_NC/" kernel.h
-          sed -i "s/^#define KC[[:space:]].*/#define KC  $BEST_KC/" kernel.h
-
-          echo ""
-          echo "=== kernel.h AFTER ==="
-          grep -E "^#define (MC|NC|KC)" kernel.h
-          echo "✅ kernel.h patched"
-
-      # ── 9. Compile matmul ──────────────────────────────────────
-      #    -march=core-avx2 -mno-avx512f = AVX2-only regardless
-      #    of what the CPU supports. No -march=native.
+      # ── 8. Compile matmul ──────────────────────────────────────
+      #    Pass MC/NC/KC as -D flags at compile time.
+      #    kernel.h uses #ifndef MC guard so -DMC=X overrides
+      #    the extern declaration — clean, no sed patching needed.
       - name: Compile matmul
         run: |
           source /opt/intel/oneapi/setvars.sh
+          echo "Compiling with MC=$BEST_MC NC=$BEST_NC KC=$BEST_KC"
           gcc -g -fopenmp matmul.c \
             -O3 -march=core-avx2 -mavx2 -mno-avx512f \
+            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
             -I$MKLROOT/include \
             -L$MKLROOT/lib/intel64 \
             -lmkl_rt -ldnnl -lpthread -lm -ldl \
             -o matmul
           echo "✅ matmul compiled (AVX2-only)"
 
-      # ── 10. Run benchmark ──────────────────────────────────────
+      # ── 9. Run benchmark ───────────────────────────────────────
       #    DNNL_MAX_CPU_ISA=AVX2 caps oneDNN to AVX2 as well.
       #    Both sides strictly AVX2 — fair on any CPU.
       - name: Run benchmark
@@ -123,11 +111,11 @@ jobs:
           echo ""
           ./matmul | tee benchmark_output.txt
 
-      # ── 11. Generate plot ──────────────────────────────────────
+      # ── 10. Generate plot ──────────────────────────────────────
       - name: Generate performance plot
         run: python3 plot.py
 
-      # ── 12. Upload all artifacts ───────────────────────────────
+      # ── 11. Upload all artifacts ───────────────────────────────
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
@@ -137,4 +125,3 @@ jobs:
             benchmark_output.txt
             benchmark_results.csv
             performance_plot.png
-            kernel.h

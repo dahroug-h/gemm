@@ -54,12 +54,12 @@ __thread int KC = 4072;
 /* ─────────────────────────────────────────────────────────────────
  * Config
  * ──────────────────────────────────────────────────────────────── */
-#define COARSE_SIZE     1024
+#define COARSE_SIZE     400
 #define COARSE_REPEATS  2
 #define COARSE_WARMUP   1
 
-static const int FINE_SIZES[] = { 512, 1024, 2048, 4000 };
-static const int N_FINE_SIZES = 4;
+static const int TUNE_SIZES[] = { 100, 200, 300, 400, 500, 600, 700, 800 };
+static const int N_TUNE_SIZES = 8;
 #define FINE_REPEATS  3
 #define FINE_WARMUP   1
 
@@ -186,7 +186,7 @@ static void run_batch(int (*combos)[3], double *results, int n,
 }
 
 /* ─────────────────────────────────────────────────────────────────
- * Score fine: harmonic mean across FINE_SIZES (sequential per size,
+ * Score fine: harmonic mean across TUNE_SIZES (sequential per size,
  * but combos within each size run in parallel)
  * ──────────────────────────────────────────────────────────────── */
 static void score_fine_batch(int (*combos)[3], double *scores, int n)
@@ -194,8 +194,8 @@ static void score_fine_batch(int (*combos)[3], double *scores, int n)
     double *inv = (double*)calloc(n, sizeof(double));
     double *tmp = (double*)malloc(n * sizeof(double));
 
-    for (int s = 0; s < N_FINE_SIZES; s++) {
-        run_batch(combos, tmp, n, FINE_SIZES[s], FINE_WARMUP, FINE_REPEATS);
+    for (int s = 0; s < N_TUNE_SIZES; s++) {
+        run_batch(combos, tmp, n, TUNE_SIZES[s], FINE_WARMUP, FINE_REPEATS);
         for (int i = 0; i < n; i++) {
             if (tmp[i] <= 0.0) inv[i] = 1e18;  /* mark as bad */
             else               inv[i] += 1.0 / tmp[i];
@@ -204,7 +204,7 @@ static void score_fine_batch(int (*combos)[3], double *scores, int n)
 
     for (int i = 0; i < n; i++) {
         if (inv[i] >= 1e17) scores[i] = -1.0;
-        else                scores[i] = (double)N_FINE_SIZES / inv[i];
+        else                scores[i] = (double)N_TUNE_SIZES / inv[i];
     }
 
     free(inv); free(tmp);
@@ -394,7 +394,7 @@ int main(void)
 
     printf("══ PHASE 2: %d fine combos (parallel=%d, harmonic mean:",
            total_f, NPAR);
-    for (int s=0;s<N_FINE_SIZES;s++) printf(" %d",FINE_SIZES[s]);
+    for (int s=0;s<N_TUNE_SIZES;s++) printf(" %d",TUNE_SIZES[s]);
     printf(") ══\n");
 
     score_fine_batch(fine_combos, fine_scores, total_f);

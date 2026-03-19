@@ -156,7 +156,7 @@ void kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int LDA, int8_t* B, int 
         for(int p = 0; p < K; p += KC) {
             int kc = min(K-p, KC);
 
-           // PRAGMA_OMP_PARALLEL_FOR
+           PRAGMA_OMP_PARALLEL_FOR
             for(int x = 0; x < nc; x++) B_col_correction[j + x] = 0;
 
             pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB, B_col_correction);
@@ -165,7 +165,7 @@ void kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int LDA, int8_t* B, int 
             for(int i = 0; i < M; i += MC) {
                 int mc = min(M-i, MC);
                 pack_A(A, Local_Buffer_A, mc, kc, i, p, LDA);
-               //PRAGMA_OMP_PARALLEL_FOR
+               PRAGMA_OMP_PARALLEL_FOR
                 for(int jr = 0; jr < nc; jr += 16) {
                     int nr = min(nc-jr, 16);
                     for(int ir = 0; ir < mc; ir += 6) {

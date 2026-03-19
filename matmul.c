@@ -64,7 +64,7 @@ void main(int LDB,int LDC,int LDA) {
     FILE *fp = fopen("benchmark_results.csv", "w");
 fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
 
-    for (int i = 100; i <= 800; i += 100) {
+    for (int i = 100; i <= 3000; i += 100) {
         
         int m = i, n = i, k = i;
         int8_t ao = 0, bo = 0;
@@ -80,7 +80,7 @@ fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
     memset(C_dnnl, 0, m * n * sizeof(int32_t));
     memset(C_naive, 0, m * n * sizeof(int32_t));
     memset(C_kernel, 0, m * n * sizeof(int32_t));
-
+/*
     dnnl_gemm_s8s8s32('N','N','F', m,n,k, 1.0f, A,m,ao, B,k,bo, 0.0f, C_dnnl,m,&oc);
    
 
@@ -96,6 +96,8 @@ fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
     0.0f,
     C_dnnl, m, &oc);
 
+
+
     //naive_matmul(A, B, C_naive, m, n, k);
     clock_t end_dnnl = clock();
 
@@ -109,8 +111,38 @@ fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
     kernel(m, n, k, A, m, B, k, C_kernel, m);
 
     clock_t end_kernel = clock();
-    
-   
+    */
+   // ── oneDNN benchmark ──────────────────────────────────────────
+// warmup + JIT compile
+dnnl_gemm_s8s8s32('N','N','F', m,n,k, 1.0f, A,m,ao, B,k,bo, 0.0f, C_dnnl,m,&oc);
+
+double best_dnnl = 1e18;
+for (int r = 0; r < 5; r++) {
+    memset(C_dnnl, 0, m*n*sizeof(int32_t));
+    clock_t t0 = clock();
+    dnnl_gemm_s8s8s32('N','N','F', m,n,k, 1.0f, A,m,ao, B,k,bo, 0.0f, C_dnnl,m,&oc);
+    clock_t t1 = clock();
+    double t = (double)(t1-t0)/CLOCKS_PER_SEC;
+    if (t < best_dnnl) best_dnnl = t;
+}
+double gflops_dnnl = 2.0*m*n*k / best_dnnl / 1e9;
+
+// ── kernel benchmark ──────────────────────────────────────────
+// warmup
+int32_t* C_warmup = (int32_t*)calloc(m*n, sizeof(int32_t));
+kernel(m,n,k, A,m, B,k, C_warmup,m);
+free(C_warmup);
+
+double best_kernel = 1e18;
+for (int r = 0; r < 5; r++) {
+    memset(C_kernel, 0, m*n*sizeof(int32_t));
+    clock_t t0 = clock();
+    kernel(m,n,k, A,m, B,k, C_kernel,m);
+    clock_t t1 = clock();
+    double t = (double)(t1-t0)/CLOCKS_PER_SEC;
+    if (t < best_kernel) best_kernel = t;
+}
+double gflops_kernel = 2.0*m*n*k / best_kernel / 1e9;
 
     if (!Check_matrix((int32_t*)C_dnnl, (int32_t*)C_kernel, m * n)) {
         printf("====Failed====\n");
@@ -118,23 +150,28 @@ fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
         printf("====Passed====\n");
     }
     
-    double time_dnnl = (double)(end_dnnl - start_dnnl) / CLOCKS_PER_SEC;
+   /* double time_dnnl = (double)(end_dnnl - start_dnnl) / CLOCKS_PER_SEC;
     double time_kernel = (double)(end_kernel - start_kernel) / CLOCKS_PER_SEC;
     double flops = 2.0 * m * n * k;
     double gflops = flops / (time_dnnl * 1e9);
 
     double gflops_k = flops / (time_kernel * 1e9);
 
-
-
+*/
 
 
 printf("[[[[[ %d x %d x %d ]]]]]\n", m, n, k);
+printf("DNNL: %f GFLOPS\n", gflops_dnnl);
+printf("ME: %f GFLOPS\n", gflops_kernel);
+fprintf(fp, "%d,%f,%f\n", m, gflops_dnnl, gflops_kernel);
+
+/*
+printf("[[[[[ %d x %d x %d ]]]]]\n", m, n, k);
 printf("DNNL: %f GFLOPS\n", gflops);
-printf("ME: %f GFLOPS\n", gflops_k);
+printf("ME: %f GFLOPS\n", gflops_k);*/
 
 
-fprintf(fp, "%d,%f,%f\n", m, gflops, gflops_k);
+//fprintf(fp, "%d,%f,%f\n", m, gflops, gflops_k);
 
 
 

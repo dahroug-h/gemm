@@ -9,6 +9,10 @@ extern int MC, NC, KC;
 #endif
 
 #ifndef NTHREADS
+#define NTHREADS 1  
+#endif
+
+#ifndef NTHREADS
     #define NTHREADS 8
 #endif
 

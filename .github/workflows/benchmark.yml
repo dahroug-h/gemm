@@ -31,8 +31,8 @@ jobs:
           key: mkl-oneapi-ubuntu22-2024
           restore-keys: mkl-oneapi-ubuntu22-
 
-      # ── 4. Print CPU info ──────────────────────────────────────
-      - name: Print CPU info
+      # ── 4. Print CPU info + detect thread count ────────────────
+      - name: Print CPU info and detect threads
         run: |
           echo "=== CPU Model ==="
           lscpu | grep "Model name"
@@ -47,6 +47,12 @@ jobs:
           grep -o 'avx[^ ]*' /proc/cpuinfo | sort -u | head -20
           echo ""
           echo "NOTE: kernel and oneDNN both restricted to AVX2."
+          echo ""
+          # detect logical CPUs and export for all subsequent steps
+          NCORES=$(nproc)
+          echo "=== Logical CPUs available: $NCORES ==="
+          echo "NCORES=$NCORES" >> $GITHUB_ENV
+          echo "OMP_NUM_THREADS=$NCORES" >> $GITHUB_ENV
 
       # ── 5. Install system dependencies ────────────────────────
       - name: Install system dependencies
@@ -78,20 +84,24 @@ jobs:
 
       # ── 8. Build autotuner ─────────────────────────────────────
       #    autotune.c includes kernel.h directly — needs AVX2 flags.
+      #    Pass NTHREADS so autotune uses all available cores.
       - name: Build autotuner
         run: |
           gcc autotune.c \
             -O3 -march=core-avx2 -mavx2 -mno-avx512f \
             -fopenmp \
+            -DNTHREADS=$NCORES \
             -o autotune -lm -lpthread
-          echo "✅ autotune compiled"
+          echo "✅ autotune compiled with NTHREADS=$NCORES"
 
       # ── 9. Run autotuner ───────────────────────────────────────
       #    Parallel in-process — no recompilation per combo.
+      #    Uses all available cores for parallel combo evaluation.
       #    Writes best MC/NC/KC to /tmp/autotune_result.txt
       - name: Run autotuner
         run: |
-          echo "Starting parallel in-process autotune..."
+          export OMP_NUM_THREADS=$NCORES
+          echo "Starting parallel in-process autotune with $NCORES threads..."
           ./autotune 2>&1 | tee autotune_log.txt
           echo ""
           echo "=== Autotune result ==="
@@ -102,32 +112,36 @@ jobs:
           echo "BEST_KC=$BEST_KC" >> $GITHUB_ENV
 
       # ── 10. Compile matmul ─────────────────────────────────────
-      #    -DMC/NC/KC passes autotuned values at compile time.
-      #    -march=core-avx2 -mno-avx512f = AVX2-only on any CPU.
+      #    -DMC/NC/KC  — autotuned values for this machine
+      #    -DNTHREADS  — matches available logical CPUs
+      #    -march=core-avx2 -mno-avx512f — AVX2-only on any CPU
       - name: Compile matmul
         run: |
           source /opt/intel/oneapi/setvars.sh
-          echo "Compiling with MC=$BEST_MC NC=$BEST_NC KC=$BEST_KC"
+          echo "Compiling with MC=$BEST_MC NC=$BEST_NC KC=$BEST_KC NTHREADS=$NCORES"
           gcc -g -fopenmp matmul.c \
             -O3 -march=core-avx2 -mavx2 -mno-avx512f \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
+            -DNTHREADS=$NCORES \
             -I$MKLROOT/include \
             -L$MKLROOT/lib/intel64 \
             -lmkl_rt -ldnnl -lpthread -lm -ldl \
             -o matmul
-          echo "✅ matmul compiled (AVX2-only)"
+          echo "✅ matmul compiled (AVX2-only, $NCORES threads)"
 
       # ── 11. Run benchmark ──────────────────────────────────────
       #    DNNL_MAX_CPU_ISA=AVX2 caps oneDNN to AVX2.
+      #    OMP_NUM_THREADS matches available CPUs.
       #    Both sides strictly AVX2 — fair on any CPU.
       - name: Run benchmark
         run: |
           source /opt/intel/oneapi/setvars.sh
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
           export DNNL_MAX_CPU_ISA=AVX2
+          export OMP_NUM_THREADS=$NCORES
           echo "=== Machine ==="
           lscpu | grep "Model name"
-          echo "=== $(nproc) logical CPUs available ==="
+          echo "=== Threads: $NCORES ==="
           echo "=== Both kernel and oneDNN: AVX2-only ==="
           echo ""
           ./matmul | tee benchmark_output.txt

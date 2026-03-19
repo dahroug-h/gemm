@@ -9,7 +9,7 @@ extern __thread int MC, NC, KC;
 #endif
 
 #ifndef NTHREADS
-#define NTHREADS 1  
+    #define NTHREADS omp_get_max_threads()
 #endif
 
 #ifndef NTHREADS
@@ -17,7 +17,7 @@ extern __thread int MC, NC, KC;
 #endif
 
 #ifndef OMP_SCHEDULE
-    #define OMP_SCHEDULE auto
+    #define OMP_SCHEDULE static
 #endif
 
 #define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(OMP_SCHEDULE) num_threads(NTHREADS)")
@@ -116,9 +116,9 @@ void macro_kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int8_t* B, int32_t
     int8_t* pa = A; 
     int8_t* pb = B;
     int K_padded = (K + 3) & ~3;
-    /*for (int j = 0; j < 16; j++) {
+    for (int j = 0; j < 16; j++) {
         _mm_prefetch((const char*)&C[j * LDC], _MM_HINT_T0);
-    }*/
+    }
 
 /*
 int l = 0;

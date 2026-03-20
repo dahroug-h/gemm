@@ -48,17 +48,21 @@ jobs:
           echo ""
           echo "NOTE: kernel and oneDNN both restricted to AVX2."
           echo ""
-          # detect logical CPUs and export for all subsequent steps
           NCORES=$(nproc)
           echo "=== Logical CPUs available: $NCORES ==="
           echo "NCORES=$NCORES" >> $GITHUB_ENV
           echo "OMP_NUM_THREADS=$NCORES" >> $GITHUB_ENV
 
-      # ── 5. Install system dependencies ────────────────────────
+      # ── 5. Install system dependencies + perf tools ───────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y gcc libgomp1 python3-pip libdnnl-dev
+          sudo apt-get install -y gcc libgomp1 python3-pip libdnnl-dev \
+            linux-tools-common linux-tools-generic linux-tools-$(uname -r) || \
+          sudo apt-get install -y linux-tools-common linux-tools-generic
+          # allow perf without sudo
+          sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
+          sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
 
       # ── 6. Install Intel MKL (skipped if cached) ───────────────
       - name: Install Intel MKL
@@ -83,8 +87,6 @@ jobs:
         run: pip3 install matplotlib numpy pandas
 
       # ── 8. Build autotuner ─────────────────────────────────────
-      #    autotune.c includes kernel.h directly — needs AVX2 flags.
-      #    Pass NTHREADS so autotune uses all available cores.
       - name: Build autotuner
         run: |
           gcc autotune.c \
@@ -95,9 +97,6 @@ jobs:
           echo "✅ autotune compiled with NTHREADS=$NCORES"
 
       # ── 9. Run autotuner ───────────────────────────────────────
-      #    Parallel in-process — no recompilation per combo.
-      #    Uses all available cores for parallel combo evaluation.
-      #    Writes best MC/NC/KC to /tmp/autotune_result.txt
       - name: Run autotuner
         run: |
           export OMP_NUM_THREADS=$NCORES
@@ -112,9 +111,7 @@ jobs:
           echo "BEST_KC=$BEST_KC" >> $GITHUB_ENV
 
       # ── 10. Compile matmul ─────────────────────────────────────
-      #    -DMC/NC/KC  — autotuned values for this machine
-      #    -DNTHREADS  — matches available logical CPUs
-      #    -march=core-avx2 -mno-avx512f — AVX2-only on any CPU
+      #    -g keeps debug symbols so perf can resolve function names
       - name: Compile matmul
         run: |
           source /opt/intel/oneapi/setvars.sh
@@ -130,9 +127,6 @@ jobs:
           echo "✅ matmul compiled (AVX2-only, $NCORES threads)"
 
       # ── 11. Run benchmark ──────────────────────────────────────
-      #    DNNL_MAX_CPU_ISA=AVX2 caps oneDNN to AVX2.
-      #    OMP_NUM_THREADS matches available CPUs.
-      #    Both sides strictly AVX2 — fair on any CPU.
       - name: Run benchmark
         run: |
           source /opt/intel/oneapi/setvars.sh
@@ -146,11 +140,69 @@ jobs:
           echo ""
           ./matmul | tee benchmark_output.txt
 
-      # ── 12. Generate plot ──────────────────────────────────────
+      # ── 12. Perf profiling — kernel bottleneck only ────────────
+      #    Records only your kernel functions, not the whole binary.
+      #    Shows:
+      #      - % time in macro_kernel vs pack_A vs pack_B
+      #      - which AVX2 instructions dominate inside macro_kernel
+      #      - IPC, L1 misses, LLC misses at large N
+      - name: Profile kernel bottleneck
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
+          export DNNL_MAX_CPU_ISA=AVX2
+          export OMP_NUM_THREADS=$NCORES
+
+          # record with dwarf call graph for full symbol resolution
+          perf record -g --call-graph=dwarf -o perf.data ./matmul \
+            2>/dev/null || true
+
+          echo "=== TOP FUNCTIONS (your kernel only) ===" \
+            | tee perf_report.txt
+
+          # show % split between your kernel functions
+          perf report --stdio --no-children -i perf.data 2>/dev/null \
+            | grep -E "macro_kernel|pack_A|pack_B|kernel\b" \
+            | grep -v "dnnl\|mkl\|gomp\|libc\|clone\|start" \
+            | head -15 | tee -a perf_report.txt
+
+          echo "" | tee -a perf_report.txt
+          echo "=== INSIDE macro_kernel (instruction breakdown) ===" \
+            | tee -a perf_report.txt
+
+          # show which instructions burn cycles inside macro_kernel
+          perf report --stdio --no-children -i perf.data 2>/dev/null \
+            | grep -A 30 "macro_kernel" \
+            | grep -E "maddubs|madd_epi|add_epi|loadu|set1|storeu|prefetch|\%" \
+            | head -20 | tee -a perf_report.txt
+
+          echo "" | tee -a perf_report.txt
+          echo "=== PERF STAT — IPC and cache misses ===" \
+            | tee -a perf_report.txt
+
+          # clean stat run for IPC/cache numbers
+          perf stat \
+            -e cycles,instructions,L1-dcache-load-misses,LLC-load-misses \
+            ./matmul 2>&1 \
+            | grep -E "cycles|instructions|insn|L1|LLC" \
+            | tee -a perf_report.txt
+
+          echo "" | tee -a perf_report.txt
+          echo "=== INTERPRETATION ===" | tee -a perf_report.txt
+          echo "IPC < 1.0  → stall-bound (memory or dependency)" \
+            | tee -a perf_report.txt
+          echo "IPC > 2.0  → compute-bound (good utilization)" \
+            | tee -a perf_report.txt
+          echo "LLC misses high → data not in cache, need better blocking" \
+            | tee -a perf_report.txt
+          echo "L1 misses high  → micro-kernel reuse ratio too low" \
+            | tee -a perf_report.txt
+
+      # ── 13. Generate plot ──────────────────────────────────────
       - name: Generate performance plot
         run: python3 plot.py
 
-      # ── 13. Upload all artifacts ───────────────────────────────
+      # ── 14. Upload all artifacts ───────────────────────────────
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
@@ -160,3 +212,4 @@ jobs:
             benchmark_output.txt
             benchmark_results.csv
             performance_plot.png
+            perf_report.txt

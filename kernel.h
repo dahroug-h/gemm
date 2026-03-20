@@ -120,21 +120,6 @@ void macro_kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int8_t* B, int32_t
         _mm_prefetch((const char*)&C[j * LDC], _MM_HINT_T0);
     }
 
-/*
-int l = 0;
-for (; l <= K_padded - 4; l += 4) {
-    { micro_kernel_6x16 }
-    { micro_kernel_6x16 }
-    { micro_kernel_6x16 }
-    { micro_kernel_6x16 }
-}
-int remainder = K_padded - l;
-switch (remainder) {
-    case 3: { micro_kernel_6x16 } [[fallthrough]]; 
-    case 2: { micro_kernel_6x16 } [[fallthrough]];
-    case 1: { micro_kernel_6x16 } break;
-    default: break;
-}*/
    for (k = 0; k < K_padded; ) {    
         micro_kernel_6x16
     }
@@ -177,11 +162,12 @@ void kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int LDA, int8_t* B, int 
 
             pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB, B_col_correction);
             int kc_padded = (kc + 3) & ~3; 
-
+             
             for(int i = 0; i < M; i += MC) {
                 int mc = min(M-i, MC);
+                
                 pack_A(A, Local_Buffer_A, mc, kc, i, p, LDA);
-               PRAGMA_OMP_PARALLEL_FOR
+                PRAGMA_OMP_PARALLEL_FOR
                 for(int jr = 0; jr < nc; jr += 16) {
                     int nr = min(nc-jr, 16);
                     for(int ir = 0; ir < mc; ir += 6) {

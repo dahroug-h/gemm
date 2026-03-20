@@ -28,8 +28,6 @@ extern __thread int MC, NC, KC;
 #define min(a,b) (((a)<(b))?(a):(b))
 
 #define micro_kernel_6x16 \
-   _mm_prefetch((const char*)(pa + 384), _MM_HINT_T1); \
-    _mm_prefetch((const char*)(pb + 512), _MM_HINT_T1); \
     __m256i b0 = _mm256_loadu_si256((__m256i*)pb); pb += 32; \
     __m256i b1 = _mm256_loadu_si256((__m256i*)pb); pb += 32; \
     \
@@ -101,6 +99,8 @@ void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc, int col_start, int row_
         }
     }
 }
+
+static inline __attribute__((always_inline))
 
 void macro_kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int8_t* B, int32_t* C, int LDC) {
     int k;

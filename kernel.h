@@ -25,17 +25,30 @@ extern __thread int MC, NC, KC;
 #define min(a,b) (((a)<(b))?(a):(b))
 
 /* ─────────────────────────────────────────────────────────────────
- * K14-K16: Two-level software prefetch
- * L1 prefetch (_T0): pulls data into L1 — short distance
- * L2 prefetch (_T1): pulls data into L2 — longer distance
- * Distances tuned for i5-10300H: L1=32KB, L2=256KB
- * pa advances 24 bytes/iter, pb advances 64 bytes/iter
+ * Prefetch distances — all autotunable via -D flags
+ * Defaults are conservative values that work on most machines.
+ * The autotuner will find optimal values for each specific CPU.
+ *   L1 hint (_T0): pulls data into L1 cache
+ *   L2 hint (_T1): pulls data into L2 cache
  * ──────────────────────────────────────────────────────────────── */
-#define PREFETCH_A_L1  192
-#define PREFETCH_B_L1  512
-#define PREFETCH_A_L2  384
-#define PREFETCH_B_L2  1024
+#ifndef PREFETCH_A_L1
+    #define PREFETCH_A_L1  192
+#endif
+#ifndef PREFETCH_B_L1
+    #define PREFETCH_B_L1  512
+#endif
+#ifndef PREFETCH_A_L2
+    #define PREFETCH_A_L2  768
+#endif
+#ifndef PREFETCH_B_L2
+    #define PREFETCH_B_L2  2048
+#endif
 
+/* ─────────────────────────────────────────────────────────────────
+ * micro_kernel_6x16
+ * Two-level prefetch on A and B (K14-K15)
+ * C prefetch at macro_kernel entry (K16)
+ * ──────────────────────────────────────────────────────────────── */
 #define micro_kernel_6x16 \
     _mm_prefetch((const char*)(pa + PREFETCH_A_L1), _MM_HINT_T0); \
     _mm_prefetch((const char*)(pa + PREFETCH_A_L2), _MM_HINT_T1); \
@@ -81,10 +94,10 @@ void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc,
         int mr = min(6, mc - i);
         for (int p = 0; p < kc; p += 4) {
             for (int r = 0; r < mr; r++) {
-                *Buffer_A++ = (p+0 < kc) ? A(row_start+i+r, col_start+p+0)+128 : 128;
-                *Buffer_A++ = (p+1 < kc) ? A(row_start+i+r, col_start+p+1)+128 : 128;
-                *Buffer_A++ = (p+2 < kc) ? A(row_start+i+r, col_start+p+2)+128 : 128;
-                *Buffer_A++ = (p+3 < kc) ? A(row_start+i+r, col_start+p+3)+128 : 128;
+                *Buffer_A++ = (p+0<kc) ? A(row_start+i+r,col_start+p+0)+128 : 128;
+                *Buffer_A++ = (p+1<kc) ? A(row_start+i+r,col_start+p+1)+128 : 128;
+                *Buffer_A++ = (p+2<kc) ? A(row_start+i+r,col_start+p+2)+128 : 128;
+                *Buffer_A++ = (p+3<kc) ? A(row_start+i+r,col_start+p+3)+128 : 128;
             }
             for (int r = mr; r < 6; r++) {
                 *Buffer_A++ = 0; *Buffer_A++ = 0;
@@ -95,7 +108,7 @@ void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc,
 }
 
 /* ─────────────────────────────────────────────────────────────────
- * pack_B — unchanged, correct layout
+ * pack_B — unchanged
  * ──────────────────────────────────────────────────────────────── */
 void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc,
             int col_start, int row_start, int LDB,
@@ -108,17 +121,15 @@ void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc,
         int nr = min(16, nc - j);
         for (int p = 0; p < kc; p += 4) {
             for (int i = 0; i < nr; i++) {
-                int8_t v0 = (p+0 < kc) ? B(row_start+p+0, col_start+j+i) : 0;
-                int8_t v1 = (p+1 < kc) ? B(row_start+p+1, col_start+j+i) : 0;
-                int8_t v2 = (p+2 < kc) ? B(row_start+p+2, col_start+j+i) : 0;
-                int8_t v3 = (p+3 < kc) ? B(row_start+p+3, col_start+j+i) : 0;
-
+                int8_t v0 = (p+0<kc) ? B(row_start+p+0,col_start+j+i) : 0;
+                int8_t v1 = (p+1<kc) ? B(row_start+p+1,col_start+j+i) : 0;
+                int8_t v2 = (p+2<kc) ? B(row_start+p+2,col_start+j+i) : 0;
+                int8_t v3 = (p+3<kc) ? B(row_start+p+3,col_start+j+i) : 0;
                 *Buffer_B++ = v0; *Buffer_B++ = v1;
                 *Buffer_B++ = v2; *Buffer_B++ = v3;
-
                 B_col_correction[col_start+j+i] +=
-                    (int32_t)v0*128 + (int32_t)v1*128 +
-                    (int32_t)v2*128 + (int32_t)v3*128;
+                    (int32_t)v0*128+(int32_t)v1*128+
+                    (int32_t)v2*128+(int32_t)v3*128;
             }
             for (int i = nr; i < 16; i++) {
                 *Buffer_B++ = 0; *Buffer_B++ = 0;
@@ -129,9 +140,7 @@ void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc,
 }
 
 /* ─────────────────────────────────────────────────────────────────
- * K13: macro_kernel — always_inline forces GCC to eliminate
- * function call ABI on AMD Zen (confirmed 5% gain in research).
- * Data layout and computation unchanged — correctness preserved.
+ * macro_kernel — always_inline (K13)
  * ──────────────────────────────────────────────────────────────── */
 static inline __attribute__((always_inline))
 void macro_kernel(int32_t M, int32_t N, int32_t K,
@@ -139,7 +148,6 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
 {
     int k;
     __m256i ones = _mm256_set1_epi16(1);
-
     __m256i c0  = _mm256_setzero_si256();
     __m256i c1  = _mm256_setzero_si256();
     __m256i c2  = _mm256_setzero_si256();
@@ -157,7 +165,7 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
     int8_t* pb = B;
     int K_padded = (K + 3) & ~3;
 
-    /* K16: prefetch all 16 C columns into L1 at entry */
+    /* K16: prefetch C columns */
     for (int j = 0; j < 16; j++)
         _mm_prefetch((const char*)&C[j * LDC], _MM_HINT_T0);
 
@@ -185,17 +193,16 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
 }
 
 /* ─────────────────────────────────────────────────────────────────
- * kernel — unchanged structure, same correctness
+ * kernel
  * ──────────────────────────────────────────────────────────────── */
 void kernel(int32_t M, int32_t N, int32_t K,
             int8_t* A, int LDA, int8_t* B, int LDB,
             int32_t* C, int LDC)
 {
     int N_safe = ((N + 15) / 16) * 16;
-
     int32_t* B_col_correction = (int32_t*)malloc(N_safe * sizeof(int32_t));
-    int8_t*  Local_Buffer_A   = (int8_t*)_mm_malloc((MC_PADDED(MC)+6) * KC, 64);
-    int8_t*  Local_Buffer_B   = (int8_t*)_mm_malloc((NC_PADDED(NC)+16) * KC, 64);
+    int8_t*  Local_Buffer_A   = (int8_t*)_mm_malloc((MC_PADDED(MC)+6)*KC, 64);
+    int8_t*  Local_Buffer_B   = (int8_t*)_mm_malloc((NC_PADDED(NC)+16)*KC, 64);
 
     if (!Local_Buffer_A || !Local_Buffer_B || !B_col_correction) {
         _mm_free(Local_Buffer_A);
@@ -205,32 +212,25 @@ void kernel(int32_t M, int32_t N, int32_t K,
     }
 
     for (int j = 0; j < N; j += NC) {
-        int nc = min(N - j, NC);
-
+        int nc = min(N-j, NC);
         for (int p = 0; p < K; p += KC) {
-            int kc = min(K - p, KC);
-
+            int kc = min(K-p, KC);
             PRAGMA_OMP_PARALLEL_FOR
-            for (int x = 0; x < nc; x++) B_col_correction[j + x] = 0;
-
+            for (int x = 0; x < nc; x++) B_col_correction[j+x] = 0;
             pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB, B_col_correction);
-            int kc_padded = (kc + 3) & ~3;
-
+            int kc_padded = (kc+3) & ~3;
             for (int i = 0; i < M; i += MC) {
-                int mc = min(M - i, MC);
+                int mc = min(M-i, MC);
                 pack_A(A, Local_Buffer_A, mc, kc, i, p, LDA);
-
                 PRAGMA_OMP_PARALLEL_FOR
                 for (int jr = 0; jr < nc; jr += 16) {
-                    int nr = min(nc - jr, 16);
+                    int nr = min(nc-jr, 16);
                     for (int ir = 0; ir < mc; ir += 6) {
-                        int mr = min(mc - ir, 6);
-
+                        int mr = min(mc-ir, 6);
                         macro_kernel(mr, nr, kc,
-                            &Local_Buffer_A[ir * kc_padded],
-                            &Local_Buffer_B[jr * kc_padded],
+                            &Local_Buffer_A[ir*kc_padded],
+                            &Local_Buffer_B[jr*kc_padded],
                             &C(i+ir, j+jr), LDC);
-
                         for (int r = 0; r < mr; r++)
                             for (int c = 0; c < nr; c++)
                                 C(i+ir+r, j+jr+c) -= B_col_correction[j+jr+c];
@@ -239,7 +239,6 @@ void kernel(int32_t M, int32_t N, int32_t K,
             }
         }
     }
-
     _mm_free(Local_Buffer_A);
     _mm_free(Local_Buffer_B);
     free(B_col_correction);

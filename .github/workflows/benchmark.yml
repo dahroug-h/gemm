@@ -22,7 +22,7 @@ jobs:
           key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/benchmark.yml') }}
           restore-keys: apt-${{ runner.os }}-
 
-      # ── 3. Cache Intel MKL (biggest time saver ~4 min → 30s) ──
+      # ── 3. Cache Intel MKL ─────────────────────────────────────
       - name: Cache Intel MKL
         id: cache-mkl
         uses: actions/cache@v4
@@ -46,8 +46,6 @@ jobs:
           echo "=== AVX flags present ==="
           grep -o 'avx[^ ]*' /proc/cpuinfo | sort -u | head -20
           echo ""
-          echo "NOTE: kernel and oneDNN both restricted to AVX2."
-          echo ""
           NCORES=$(nproc)
           echo "=== Logical CPUs available: $NCORES ==="
           echo "NCORES=$NCORES" >> $GITHUB_ENV
@@ -60,7 +58,6 @@ jobs:
           sudo apt-get install -y gcc libgomp1 python3-pip libdnnl-dev \
             linux-tools-common linux-tools-generic linux-tools-$(uname -r) || \
           sudo apt-get install -y linux-tools-common linux-tools-generic
-          # allow perf without sudo
           sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
 
@@ -97,28 +94,44 @@ jobs:
           echo "✅ autotune compiled with NTHREADS=$NCORES"
 
       # ── 9. Run autotuner ───────────────────────────────────────
+      #    Phase 1: coarse MC/NC/KC
+      #    Phase 2: fine MC/NC/KC (harmonic mean N=512,1024,2048)
+      #    Phase 3: prefetch sweep (25 combos PA×PB)
+      #    Writes 7 values to /tmp/autotune_result.txt:
+      #      MC NC KC PA_L1 PB_L1 PA_L2 PB_L2
       - name: Run autotuner
         run: |
           export OMP_NUM_THREADS=$NCORES
-          echo "Starting parallel in-process autotune with $NCORES threads..."
+          echo "Starting autotune (MC/NC/KC + prefetch) with $NCORES threads..."
           ./autotune 2>&1 | tee autotune_log.txt
           echo ""
-          echo "=== Autotune result ==="
+          echo "=== Autotune result (7 values) ==="
           cat /tmp/autotune_result.txt
-          read BEST_MC BEST_NC BEST_KC < /tmp/autotune_result.txt
-          echo "BEST_MC=$BEST_MC" >> $GITHUB_ENV
-          echo "BEST_NC=$BEST_NC" >> $GITHUB_ENV
-          echo "BEST_KC=$BEST_KC" >> $GITHUB_ENV
+          read BEST_MC BEST_NC BEST_KC BEST_PA1 BEST_PB1 BEST_PA2 BEST_PB2 \
+            < /tmp/autotune_result.txt
+          echo "BEST_MC=$BEST_MC"   >> $GITHUB_ENV
+          echo "BEST_NC=$BEST_NC"   >> $GITHUB_ENV
+          echo "BEST_KC=$BEST_KC"   >> $GITHUB_ENV
+          echo "BEST_PA1=$BEST_PA1" >> $GITHUB_ENV
+          echo "BEST_PB1=$BEST_PB1" >> $GITHUB_ENV
+          echo "BEST_PA2=$BEST_PA2" >> $GITHUB_ENV
+          echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
 
       # ── 10. Compile matmul ─────────────────────────────────────
-      #    -g keeps debug symbols so perf can resolve function names
+      #    All 7 autotuned values passed as -D flags
       - name: Compile matmul
         run: |
           source /opt/intel/oneapi/setvars.sh
-          echo "Compiling with MC=$BEST_MC NC=$BEST_NC KC=$BEST_KC NTHREADS=$NCORES"
+          echo "Compiling with:"
+          echo "  MC=$BEST_MC NC=$BEST_NC KC=$BEST_KC"
+          echo "  PREFETCH_A_L1=$BEST_PA1 PREFETCH_B_L1=$BEST_PB1"
+          echo "  PREFETCH_A_L2=$BEST_PA2 PREFETCH_B_L2=$BEST_PB2"
+          echo "  NTHREADS=$NCORES"
           gcc -g -fopenmp matmul.c \
             -O3 -march=core-avx2 -mavx2 -mno-avx512f \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
+            -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
+            -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
             -DNTHREADS=$NCORES \
             -I$MKLROOT/include \
             -L$MKLROOT/lib/intel64 \
@@ -140,12 +153,7 @@ jobs:
           echo ""
           ./matmul | tee benchmark_output.txt
 
-      # ── 12. Perf profiling — kernel bottleneck only ────────────
-      #    Records only your kernel functions, not the whole binary.
-      #    Shows:
-      #      - % time in macro_kernel vs pack_A vs pack_B
-      #      - which AVX2 instructions dominate inside macro_kernel
-      #      - IPC, L1 misses, LLC misses at large N
+      # ── 12. Perf profiling ─────────────────────────────────────
       - name: Profile kernel bottleneck
         run: |
           source /opt/intel/oneapi/setvars.sh
@@ -153,49 +161,28 @@ jobs:
           export DNNL_MAX_CPU_ISA=AVX2
           export OMP_NUM_THREADS=$NCORES
 
-          # record with dwarf call graph for full symbol resolution
           perf record -g --call-graph=dwarf -o perf.data ./matmul \
             2>/dev/null || true
 
-          echo "=== TOP FUNCTIONS (your kernel only) ===" \
-            | tee perf_report.txt
-
-          # show % split between your kernel functions
+          echo "=== TOP FUNCTIONS ===" | tee perf_report.txt
           perf report --stdio --no-children -i perf.data 2>/dev/null \
             | grep -E "macro_kernel|pack_A|pack_B|kernel\b" \
             | grep -v "dnnl\|mkl\|gomp\|libc\|clone\|start" \
             | head -15 | tee -a perf_report.txt
 
           echo "" | tee -a perf_report.txt
-          echo "=== INSIDE macro_kernel (instruction breakdown) ===" \
-            | tee -a perf_report.txt
-
-          # show which instructions burn cycles inside macro_kernel
+          echo "=== INSIDE macro_kernel ===" | tee -a perf_report.txt
           perf report --stdio --no-children -i perf.data 2>/dev/null \
             | grep -A 30 "macro_kernel" \
             | grep -E "maddubs|madd_epi|add_epi|loadu|set1|storeu|prefetch|\%" \
             | head -20 | tee -a perf_report.txt
 
           echo "" | tee -a perf_report.txt
-          echo "=== PERF STAT — IPC and cache misses ===" \
-            | tee -a perf_report.txt
-
-          # clean stat run for IPC/cache numbers
+          echo "=== PERF STAT ===" | tee -a perf_report.txt
           perf stat \
             -e cycles,instructions,L1-dcache-load-misses,LLC-load-misses \
             ./matmul 2>&1 \
             | grep -E "cycles|instructions|insn|L1|LLC" \
-            | tee -a perf_report.txt
-
-          echo "" | tee -a perf_report.txt
-          echo "=== INTERPRETATION ===" | tee -a perf_report.txt
-          echo "IPC < 1.0  → stall-bound (memory or dependency)" \
-            | tee -a perf_report.txt
-          echo "IPC > 2.0  → compute-bound (good utilization)" \
-            | tee -a perf_report.txt
-          echo "LLC misses high → data not in cache, need better blocking" \
-            | tee -a perf_report.txt
-          echo "L1 misses high  → micro-kernel reuse ratio too low" \
             | tee -a perf_report.txt
 
       # ── 13. Generate plot ──────────────────────────────────────

@@ -28,8 +28,8 @@ extern __thread int MC, NC, KC;
 #define min(a,b) (((a)<(b))?(a):(b))
 
 #define micro_kernel_6x16 \
-   _mm_prefetch((const char*)(pa + 192), _MM_HINT_T1); \
-    _mm_prefetch((const char*)(pb + 256), _MM_HINT_T1); \
+   _mm_prefetch((const char*)(pa + 384), _MM_HINT_T1); \
+    _mm_prefetch((const char*)(pb + 512), _MM_HINT_T1); \
     __m256i b0 = _mm256_loadu_si256((__m256i*)pb); pb += 32; \
     __m256i b1 = _mm256_loadu_si256((__m256i*)pb); pb += 32; \
     \
@@ -162,7 +162,7 @@ void kernel(int32_t M, int32_t N, int32_t K, int8_t* A, int LDA, int8_t* B, int 
 
             pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB, B_col_correction);
             int kc_padded = (kc + 3) & ~3; 
-             
+            
             for(int i = 0; i < M; i += MC) {
                 int mc = min(M-i, MC);
                 

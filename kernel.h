@@ -24,31 +24,20 @@ extern __thread int MC, NC, KC;
 
 #define min(a,b) (((a)<(b))?(a):(b))
 
-/* ─────────────────────────────────────────────────────────────────
- * Prefetch distances — all autotunable via -D flags
- * Defaults are conservative values that work on most machines.
- * The autotuner will find optimal values for each specific CPU.
- *   L1 hint (_T0): pulls data into L1 cache
- *   L2 hint (_T1): pulls data into L2 cache
- * ──────────────────────────────────────────────────────────────── */
+/* ── prefetch distances — all autotunable via -D flags ── */
 #ifndef PREFETCH_A_L1
     #define PREFETCH_A_L1  192
 #endif
 #ifndef PREFETCH_B_L1
-    #define PREFETCH_B_L1  512
+    #define PREFETCH_B_L1  256
 #endif
 #ifndef PREFETCH_A_L2
     #define PREFETCH_A_L2  768
 #endif
 #ifndef PREFETCH_B_L2
-    #define PREFETCH_B_L2  2048
+    #define PREFETCH_B_L2  1024
 #endif
 
-/* ─────────────────────────────────────────────────────────────────
- * micro_kernel_6x16
- * Two-level prefetch on A and B (K14-K15)
- * C prefetch at macro_kernel entry (K16)
- * ──────────────────────────────────────────────────────────────── */
 #define micro_kernel_6x16 \
     _mm_prefetch((const char*)(pa + PREFETCH_A_L1), _MM_HINT_T0); \
     _mm_prefetch((const char*)(pa + PREFETCH_A_L2), _MM_HINT_T1); \
@@ -84,9 +73,6 @@ extern __thread int MC, NC, KC;
     pa += 24; \
     k  += 4;
 
-/* ─────────────────────────────────────────────────────────────────
- * pack_A — unchanged
- * ──────────────────────────────────────────────────────────────── */
 void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc,
             int row_start, int col_start, int LDA)
 {
@@ -107,9 +93,6 @@ void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc,
     }
 }
 
-/* ─────────────────────────────────────────────────────────────────
- * pack_B — unchanged
- * ──────────────────────────────────────────────────────────────── */
 void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc,
             int col_start, int row_start, int LDB,
             int32_t* B_col_correction)
@@ -139,9 +122,6 @@ void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc,
     }
 }
 
-/* ─────────────────────────────────────────────────────────────────
- * macro_kernel — always_inline (K13)
- * ──────────────────────────────────────────────────────────────── */
 static inline __attribute__((always_inline))
 void macro_kernel(int32_t M, int32_t N, int32_t K,
                   int8_t* A, int8_t* B, int32_t* C, int LDC)
@@ -165,7 +145,6 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
     int8_t* pb = B;
     int K_padded = (K + 3) & ~3;
 
-    /* K16: prefetch C columns */
     for (int j = 0; j < 16; j++)
         _mm_prefetch((const char*)&C[j * LDC], _MM_HINT_T0);
 
@@ -192,9 +171,6 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
             C(r, c) += tmp[r][c];
 }
 
-/* ─────────────────────────────────────────────────────────────────
- * kernel
- * ──────────────────────────────────────────────────────────────── */
 void kernel(int32_t M, int32_t N, int32_t K,
             int8_t* A, int LDA, int8_t* B, int LDB,
             int32_t* C, int LDC)
@@ -213,15 +189,20 @@ void kernel(int32_t M, int32_t N, int32_t K,
 
     for (int j = 0; j < N; j += NC) {
         int nc = min(N-j, NC);
+
         for (int p = 0; p < K; p += KC) {
             int kc = min(K-p, KC);
+
             PRAGMA_OMP_PARALLEL_FOR
             for (int x = 0; x < nc; x++) B_col_correction[j+x] = 0;
+
             pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB, B_col_correction);
             int kc_padded = (kc+3) & ~3;
+
             for (int i = 0; i < M; i += MC) {
                 int mc = min(M-i, MC);
                 pack_A(A, Local_Buffer_A, mc, kc, i, p, LDA);
+
                 PRAGMA_OMP_PARALLEL_FOR
                 for (int jr = 0; jr < nc; jr += 16) {
                     int nr = min(nc-jr, 16);
@@ -231,14 +212,20 @@ void kernel(int32_t M, int32_t N, int32_t K,
                             &Local_Buffer_A[ir*kc_padded],
                             &Local_Buffer_B[jr*kc_padded],
                             &C(i+ir, j+jr), LDC);
-                        for (int r = 0; r < mr; r++)
-                            for (int c = 0; c < nr; c++)
-                                C(i+ir+r, j+jr+c) -= B_col_correction[j+jr+c];
                     }
                 }
             }
+
+            /* ── correction applied ONCE per KC panel ──
+             * after ALL MC blocks are done for this KC strip.
+             * Previously it was inside the MC loop which caused
+             * M/MC × overcorrection at large M — now fixed.     */
+            for (int i = 0; i < M; i++)
+                for (int c = 0; c < nc; c++)
+                    C(i, j+c) -= B_col_correction[j+c];
         }
     }
+
     _mm_free(Local_Buffer_A);
     _mm_free(Local_Buffer_B);
     free(B_col_correction);

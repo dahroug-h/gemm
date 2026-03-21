@@ -14,6 +14,12 @@ extern __thread int MC, NC, KC;
     #define NTHREADS omp_get_max_threads()
 #endif
 
+#ifndef OMP_SCHEDULE
+    #define OMP_SCHEDULE static
+#endif
+
+#define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(OMP_SCHEDULE) num_threads(NTHREADS)")
+
 #define MC_PADDED(mc) (((mc + 5) / 6) * 6)
 #define NC_PADDED(nc) (((nc + 15) / 16) * 16)
 
@@ -73,6 +79,8 @@ void pack_A(int8_t* __restrict A, int8_t* __restrict Buffer_A, int mc, int kc,
     for (int i = 0; i < mc; i += 6) {
         int mr = min(6, mc - i);
         int p = 0;
+        
+        // PURE SPEED: Fast XOR loop (Mathematically adds 128)
         for (; p + 3 < kc; p += 4) {
             for (int r = 0; r < mr; r++) {
                 *Buffer_A++ = A(row_start+i+r, col_start+p+0) ^ 0x80;
@@ -81,9 +89,11 @@ void pack_A(int8_t* __restrict A, int8_t* __restrict Buffer_A, int mc, int kc,
                 *Buffer_A++ = A(row_start+i+r, col_start+p+3) ^ 0x80;
             }
             for (int r = mr; r < 6; r++) {
-                *((int32_t*)Buffer_A) = 0x80808080; Buffer_A += 4;
+                *((int32_t*)Buffer_A) = 0x80808080; Buffer_A += 4; 
             }
         }
+        
+        // Fringe loop
         if (p < kc) {
             for (int r = 0; r < mr; r++) {
                 *Buffer_A++ = (p+0<kc) ? (A(row_start+i+r, col_start+p+0) ^ 0x80) : 0x80;
@@ -104,6 +114,8 @@ void pack_B(int8_t* __restrict B, int8_t* __restrict Buffer_B, int nc, int kc,
     for (int j = 0; j < nc; j += 16) {
         int nr = min(16, nc - j);
         int p = 0;
+        
+        // PURE SPEED: Memory copy only, absolutely no correction math inside
         for (; p + 3 < kc; p += 4) {
             for (int i = 0; i < nr; i++) {
                 *Buffer_B++ = B(row_start+p+0, col_start+j+i);
@@ -115,6 +127,8 @@ void pack_B(int8_t* __restrict B, int8_t* __restrict Buffer_B, int nc, int kc,
                 *((int32_t*)Buffer_B) = 0; Buffer_B += 4;
             }
         }
+        
+        // Fringe loop
         if (p < kc) {
             for (int i = 0; i < nr; i++) {
                 *Buffer_B++ = (p+0<kc) ? B(row_start+p+0, col_start+j+i) : 0;
@@ -159,6 +173,7 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
         micro_kernel_6x16
     }
 
+    // PURE SPEED: Directly store results without any vector subtraction
     int32_t tmp[6][16] __attribute__((aligned(32)));
     _mm256_storeu_si256((__m256i*)&tmp[0][0], c0);
     _mm256_storeu_si256((__m256i*)&tmp[0][8], c1);
@@ -182,66 +197,51 @@ void kernel(int32_t M, int32_t N, int32_t K,
             int8_t* __restrict A, int LDA, int8_t* __restrict B, int LDB,
             int32_t* __restrict C, int LDC)
 {
-    // 1. FAST MAP-REDUCE GLOBAL SUM
-    int32_t* B_col_sum = (int32_t*)calloc(N, sizeof(int32_t));
+    // 1. FAST GLOBAL OFFSET PRE-CALCULATION
+    // B is column-major, so reading B(k, j) with k inside is perfectly contiguous
+    int32_t* B_col_sum = (int32_t*)malloc(N * sizeof(int32_t));
     if (!B_col_sum) return;
     
-    #pragma omp parallel
-    {
-        int32_t* local_sum = (int32_t*)calloc(N, sizeof(int32_t));
-        #pragma omp for schedule(static)
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < N; j++) {
+        int32_t sum = 0;
         for (int k = 0; k < K; k++) {
-            for (int j = 0; j < N; j++) {
-                local_sum[j] += B(k, j);
-            }
+            sum += B(k, j);
         }
-        #pragma omp critical
-        for (int j = 0; j < N; j++) B_col_sum[j] += local_sum[j];
-        free(local_sum);
-    }
-    
-    // Fast vector-multiply by 128
-    for (int j = 0; j < N; j++) B_col_sum[j] <<= 7; 
-
-    // 2. ZERO-LOCK THREAD BUFFER ALLOCATION
-    int max_threads = NTHREADS;
-    int8_t** Thread_Buffer_A = (int8_t**)malloc(max_threads * sizeof(int8_t*));
-    for(int t = 0; t < max_threads; t++) {
-        Thread_Buffer_A[t] = (int8_t*)_mm_malloc((MC_PADDED(MC)+6)*KC, 64);
-    }
-    int8_t* Shared_Buffer_B = (int8_t*)_mm_malloc((NC_PADDED(NC)+16)*KC, 64);
-
-    if (!Shared_Buffer_B || !Thread_Buffer_A[0]) {
-        // Handle abort
-        free(B_col_sum); return;
+        B_col_sum[j] = sum * 128; 
     }
 
-    // 3. THE OPTIMIZED GEMM CORE
+    // 2. THE PURE SPEED GEMM (OpenMP threading reverted to the safe, fast 'jr' loop)
+    int8_t* Local_Buffer_A = (int8_t*)_mm_malloc((MC_PADDED(MC)+6)*KC, 64);
+    int8_t* Local_Buffer_B = (int8_t*)_mm_malloc((NC_PADDED(NC)+16)*KC, 64);
+
+    if (!Local_Buffer_A || !Local_Buffer_B) {
+        if (Local_Buffer_A) _mm_free(Local_Buffer_A);
+        if (Local_Buffer_B) _mm_free(Local_Buffer_B);
+        free(B_col_sum);
+        return;
+    }
+
     for (int j = 0; j < N; j += NC) {
         int nc = min(N-j, NC);
         for (int p = 0; p < K; p += KC) {
             int kc = min(K-p, KC);
+            pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB); 
             int kc_padded = (kc+3) & ~3;
 
-            // Pack B once per KC panel sequentially (it's fast enough to not need threading)
-            pack_B(B, Shared_Buffer_B, nc, kc, j, p, LDB); 
-
-            // PARALLELIZE OVER THE M-DIMENSION TO PREVENT FORK/JOIN THRASHING
-            #pragma omp parallel for schedule(static)
             for (int i = 0; i < M; i += MC) {
-                int tid = omp_get_thread_num();
                 int mc = min(M-i, MC);
-                int8_t* Local_A = Thread_Buffer_A[tid];
+                pack_A(A, Local_Buffer_A, mc, kc, i, p, LDA);
 
-                pack_A(A, Local_A, mc, kc, i, p, LDA);
-
+                // OpenMP threading restored to the safe zone!
+                PRAGMA_OMP_PARALLEL_FOR
                 for (int jr = 0; jr < nc; jr += 16) {
                     int nr = min(nc-jr, 16);
                     for (int ir = 0; ir < mc; ir += 6) {
                         int mr = min(mc-ir, 6);
                         macro_kernel(mr, nr, kc,
-                            &Local_A[ir*kc_padded],
-                            &Shared_Buffer_B[jr*kc_padded],
+                            &Local_Buffer_A[ir*kc_padded],
+                            &Local_Buffer_B[jr*kc_padded],
                             &C(i+ir, j+jr), LDC); 
                     }
                 }
@@ -249,17 +249,17 @@ void kernel(int32_t M, int32_t N, int32_t K,
         }
     }
 
-    // 4. INSTANT PARALLEL CORRECTION
+    // 3. INSTANT GLOBAL CORRECTION (Cache-aware order!)
+    // C is column-major, so 'i' MUST be the inner loop to prevent Stride-of-Death
     #pragma omp parallel for schedule(static)
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
-            C(i, j) -= B_col_sum[j];
+    for (int j = 0; j < N; j++) {
+        int32_t corr = B_col_sum[j];
+        for (int i = 0; i < M; i++) {
+            C(i, j) -= corr;
         }
     }
 
-    // 5. CLEANUP
-    for(int t = 0; t < max_threads; t++) _mm_free(Thread_Buffer_A[t]);
-    free(Thread_Buffer_A);
-    _mm_free(Shared_Buffer_B);
+    _mm_free(Local_Buffer_A);
+    _mm_free(Local_Buffer_B);
     free(B_col_sum);
 }

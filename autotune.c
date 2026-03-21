@@ -4,10 +4,10 @@
  * Phase 1: coarse MC/NC/KC grid at N=1024
  * Phase 2: fine MC/NC/KC around winner, harmonic mean N=512-2048
  * Phase 3: prefetch distance sweep with best MC/NC/KC fixed
- *          25 combos (5 PA × 5 PB), harmonic mean N=512-2048
+ * 25 combos (5 PA × 5 PB), harmonic mean N=512-2048
  *
  * Writes to /tmp/autotune_result.txt:
- *   MC NC KC PA_L1 PB_L1 PA_L2 PB_L2
+ * MC NC KC PA_L1 PB_L1 PA_L2 PB_L2
  */
 
 #define _GNU_SOURCE
@@ -60,7 +60,8 @@ static const int PB_L1_VALS[] = { 128, 256, 512, 1024, 2048 };
 static const int N_PA = 5;
 static const int N_PB = 5;
 
-static int NPAR = 2;
+// CRITICAL FIX: Set to 1 to prevent OpenMP oversubscription during benchmarking
+static int NPAR = 1; 
 
 /* ─────────────────────────────────────────────────────────────────
  * Cache detection
@@ -93,10 +94,9 @@ typedef struct {
 static void *bench_thread(void *arg)
 {
     BenchTask *t = (BenchTask*)arg;
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(t->cpu_id % (int)sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    // Affinity mapping removed because OpenMP handles its own thread affinity natively.
+    // Pinning the master thread here while letting OpenMP spawn workers causes conflicts.
 
     MC = t->mc; NC = t->nc; KC = t->kc;
     PFETCH_A_L1 = t->pa_l1; PFETCH_B_L1 = t->pb_l1;
@@ -212,7 +212,8 @@ static void fine_neighbours(int center,int align,int lo,int hi,int*out,int*n){
 int main(void)
 {
     int ncpus=(int)sysconf(_SC_NPROCESSORS_ONLN);
-    NPAR=ncpus<4?ncpus:4;
+    // CRITICAL: Ensure we run GEMM benchmarks one at a time for accurate threading
+    NPAR=1; 
 
     printf("==============================================\n");
     printf("  int8 GEMM Auto-Tuner (MC/NC/KC + Prefetch)\n");
@@ -251,7 +252,7 @@ int main(void)
         int kc=kc_c[ki];
         gen_mc(l2_kb,l3_kb,kc,mc_c,&n_mc,16);
         gen_nc(l3_kb,kc,nc_c,&n_nc,16);
-        /* run NPAR combos in parallel */
+        
         int total_mi_ni=n_mc*n_nc;
         BenchTask *tasks=malloc(total_mi_ni*sizeof(BenchTask));
         int ti=0;
@@ -348,7 +349,6 @@ int main(void)
     int best_pa2=def_pa2,best_pb2=def_pb2;
     double best_pf=-1.0;
 
-    /* score default first */
     best_pf=score_mc_nc_kc_fine(best_mc,best_nc,best_kc,
                                  def_pa1,def_pb1,def_pa2,def_pb2);
     printf("%-7d %-7d  %.2f [default]\n",def_pa1,def_pb1,best_pf);

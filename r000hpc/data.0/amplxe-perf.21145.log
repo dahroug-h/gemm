@@ -1,0 +1,96 @@
+threads_spec: cpu
+Using CPUID GenuineIntel-6-A5-2
+DEBUGINFOD_URLS=
+Compression enabled, disabling build id collection at the end of the session.
+nr_threads: 8
+thread_masks[0]: 0x5a66c3fc78e0: maps mask[8]: 0
+thread_masks[0]: 0x5a66c3fc78f0: affinity mask[8]: 0
+thread_masks[1]: 0x5a66c3fc7900: maps mask[8]: 1
+thread_masks[1]: 0x5a66c3fc7910: affinity mask[8]: 1
+thread_masks[2]: 0x5a66c3fc7920: maps mask[8]: 2
+thread_masks[2]: 0x5a66c3fc7930: affinity mask[8]: 2
+thread_masks[3]: 0x5a66c3fc7940: maps mask[8]: 3
+thread_masks[3]: 0x5a66c3fc7950: affinity mask[8]: 3
+thread_masks[4]: 0x5a66c3fc7960: maps mask[8]: 4
+thread_masks[4]: 0x5a66c3fc7970: affinity mask[8]: 4
+thread_masks[5]: 0x5a66c3fc7980: maps mask[8]: 5
+thread_masks[5]: 0x5a66c3fc7990: affinity mask[8]: 5
+thread_masks[6]: 0x5a66c3fc79a0: maps mask[8]: 6
+thread_masks[6]: 0x5a66c3fc79b0: affinity mask[8]: 6
+thread_masks[7]: 0x5a66c3fc79c0: maps mask[8]: 7
+thread_masks[7]: 0x5a66c3fc79d0: affinity mask[8]: 7
+nr_cblocks: 0
+affinity: SYS
+mmap flush: 1
+comp level: 1
+mmap size 528384B
+couldn't open /proc/1/task/1/maps
+couldn't open /proc/363/task/363/maps
+couldn't open /proc/468/task/468/maps
+couldn't open /proc/1293/task/1293/maps
+couldn't open /proc/1294/task/1294/maps
+couldn't open /proc/1303/task/1303/maps
+couldn't open /proc/1304/task/1304/maps
+couldn't open /proc/1305/task/1305/maps
+couldn't open /proc/1308/task/1308/maps
+couldn't open /proc/1329/task/1329/maps
+couldn't open /proc/1330/task/1330/maps
+couldn't open /proc/1335/task/1335/maps
+couldn't open /proc/1336/task/1336/maps
+couldn't open /proc/1338/task/1338/maps
+couldn't open /proc/1340/task/1340/maps
+couldn't open /proc/1341/task/1341/maps
+couldn't open /proc/1342/task/1342/maps
+couldn't open /proc/1347/task/1347/maps
+couldn't open /proc/1352/task/1352/maps
+couldn't open /proc/1369/task/1369/maps
+couldn't open /proc/1433/task/1433/maps
+couldn't open /proc/1664/task/1664/maps
+couldn't open /proc/1665/task/1665/maps
+couldn't open /proc/1667/task/1667/maps
+couldn't open /proc/1717/task/1717/maps
+couldn't open /proc/1919/task/1919/maps
+couldn't open /proc/1920/task/1920/maps
+couldn't open /proc/1922/task/1922/maps
+couldn't open /proc/1923/task/1923/maps
+couldn't open /proc/1925/task/1925/maps
+couldn't open /proc/1972/task/1972/maps
+couldn't open /proc/1989/task/1989/maps
+couldn't open /proc/2004/task/2004/maps
+couldn't open /proc/2104/task/2104/maps
+couldn't open /proc/2105/task/2105/maps
+couldn't open /proc/2127/task/2127/maps
+couldn't open /proc/2141/task/2141/maps
+couldn't open /proc/2142/task/2142/maps
+couldn't open /proc/2146/task/2146/maps
+couldn't open /proc/2149/task/2149/maps
+couldn't open /proc/2201/task/2201/maps
+couldn't open /proc/2650/task/2650/maps
+couldn't open /proc/2987/task/2987/maps
+couldn't open /proc/2997/task/2997/maps
+couldn't open /proc/3002/task/3002/maps
+couldn't open /proc/3074/task/3074/maps
+couldn't open /proc/4447/task/4447/maps
+couldn't open /proc/6587/task/6587/maps
+couldn't open /proc/16591/task/16591/maps
+threads[21147]: started on cpu1
+threads[21148]: started on cpu2
+threads[21149]: started on cpu3
+threads[21150]: started on cpu4
+threads[21151]: started on cpu5
+threads[21152]: started on cpu6
+threads[21153]: started on cpu7
+threads[21145]: started on cpu0
+
+21146:perf-sync:ready:TSC=95904684852012
+[ perf record: Woken up 113 times to write data ]
+threads[21145]: samples=25, wakes=10, transferred=2488032, compressed=390670
+threads[21147]: samples=32, wakes=14, transferred=3256664, compressed=490801
+threads[21148]: samples=21, wakes=10, transferred=2329856, compressed=370120
+threads[21149]: samples=28, wakes=12, transferred=2675464, compressed=406714
+threads[21150]: samples=47, wakes=20, transferred=4788688, compressed=704591
+threads[21151]: samples=57, wakes=23, transferred=5736472, compressed=825250
+threads[21152]: samples=24, wakes=10, transferred=2198408, compressed=344916
+threads[21153]: samples=71, wakes=28, transferred=6882304, compressed=974413
+failed to write feature HYBRID_TOPOLOGY
+[ perf record: Captured and wrote 11.355 MB /home/dahroug/Desktop/gemm.dahroug/r000hpc/data.0/system-wide.perf, compressed (original 28.950 MB, ratio is 6.735) ]

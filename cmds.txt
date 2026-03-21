@@ -1,0 +1,13 @@
+gcc -g -fopenmp matmul.c \
+  -O3 -march=core-avx2 -mavx2 -mno-avx512f \
+  -DMC=32 -DNC=1192 -DKC=12288 \
+  -I/usr/include/mkl \
+  -lmkl_rt -ldnnl -lpthread -lm -ldl \
+  -o matmul
+
+
+
+gcc autotune.c \
+  -O3 -march=core-avx2 -mavx2 -mno-avx512f \
+  -fopenmp \
+  -o autotune -lm -lpthread

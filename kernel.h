@@ -1,6 +1,6 @@
 #include <omp.h>
 #include "immintrin.h"
-#include <stdlib.h> // For malloc/free if needed, though we use _mm_malloc
+#include <stdlib.h>
 
 #define A(i,j) A[(i)+(j)*LDA]
 #define B(i,j) B[(i)+(j)*LDB]
@@ -25,7 +25,6 @@ extern __thread int MC, NC, KC;
 
 #define min(a,b) (((a)<(b))?(a):(b))
 
-/* ── prefetch distances — all autotunable via -D flags ── */
 #ifndef PREFETCH_A_L1
     #define PREFETCH_A_L1  192
 #endif
@@ -81,34 +80,40 @@ void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc,
         int mr = min(6, mc - i);
         for (int p = 0; p < kc; p += 4) {
             for (int r = 0; r < mr; r++) {
-                // Direct copy, assumes A is already scaled/unsigned
-                *Buffer_A++ = (p+0<kc) ? A(row_start+i+r,col_start+p+0) : 0;
-                *Buffer_A++ = (p+1<kc) ? A(row_start+i+r,col_start+p+1) : 0;
-                *Buffer_A++ = (p+2<kc) ? A(row_start+i+r,col_start+p+2) : 0;
-                *Buffer_A++ = (p+3<kc) ? A(row_start+i+r,col_start+p+3) : 0;
+                // Re-added +128 shift to map [-128, 127] to [0, 255] for maddubs
+                *Buffer_A++ = (int8_t)((p+0<kc) ? A(row_start+i+r,col_start+p+0) + 128 : 128);
+                *Buffer_A++ = (int8_t)((p+1<kc) ? A(row_start+i+r,col_start+p+1) + 128 : 128);
+                *Buffer_A++ = (int8_t)((p+2<kc) ? A(row_start+i+r,col_start+p+2) + 128 : 128);
+                *Buffer_A++ = (int8_t)((p+3<kc) ? A(row_start+i+r,col_start+p+3) + 128 : 128);
             }
             for (int r = mr; r < 6; r++) {
-                *Buffer_A++ = 0; *Buffer_A++ = 0;
-                *Buffer_A++ = 0; *Buffer_A++ = 0;
+                // Pad with 128 (which acts as mathematical zero after correction)
+                *Buffer_A++ = -128; *Buffer_A++ = -128; // -128 in int8 is 128 in uint8
+                *Buffer_A++ = -128; *Buffer_A++ = -128; 
             }
         }
     }
 }
 
 void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc,
-            int col_start, int row_start, int LDB)
+            int col_start, int row_start, int LDB, int32_t* B_col_corr_local)
 {
+    // Clear local correction buffer for this NC block
+    for (int x = 0; x < nc; x++) B_col_corr_local[x] = 0;
+
     for (int j = 0; j < nc; j += 16) {
         int nr = min(16, nc - j);
         for (int p = 0; p < kc; p += 4) {
             for (int i = 0; i < nr; i++) {
-                // Direct copy, no correction factor math
                 int8_t v0 = (p+0<kc) ? B(row_start+p+0,col_start+j+i) : 0;
                 int8_t v1 = (p+1<kc) ? B(row_start+p+1,col_start+j+i) : 0;
                 int8_t v2 = (p+2<kc) ? B(row_start+p+2,col_start+j+i) : 0;
                 int8_t v3 = (p+3<kc) ? B(row_start+p+3,col_start+j+i) : 0;
                 *Buffer_B++ = v0; *Buffer_B++ = v1;
                 *Buffer_B++ = v2; *Buffer_B++ = v3;
+                
+                // Calculate correction inline (virtually free)
+                B_col_corr_local[j+i] += (int32_t)v0*128 + (int32_t)v1*128 + (int32_t)v2*128 + (int32_t)v3*128;
             }
             for (int i = nr; i < 16; i++) {
                 *Buffer_B++ = 0; *Buffer_B++ = 0;
@@ -120,7 +125,7 @@ void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc,
 
 static inline __attribute__((always_inline))
 void macro_kernel(int32_t M, int32_t N, int32_t K,
-                  int8_t* A, int8_t* B, int32_t* C, int LDC)
+                  int8_t* A, int8_t* B, int32_t* C, int LDC, int32_t* B_corr)
 {
     int k;
     __m256i ones = _mm256_set1_epi16(1);
@@ -148,6 +153,20 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
         micro_kernel_6x16
     }
 
+    // --- THE BOOST TRICK: REGISTER-LEVEL CORRECTION ---
+    // Load the pre-calculated corrections directly into AVX registers
+    __m256i corr0 = _mm256_loadu_si256((__m256i*)(B_corr + 0));
+    __m256i corr1 = _mm256_loadu_si256((__m256i*)(B_corr + 8));
+
+    // Subtract them before saving to memory! No extra memory loops.
+    c0 = _mm256_sub_epi32(c0, corr0); c1 = _mm256_sub_epi32(c1, corr1);
+    c2 = _mm256_sub_epi32(c2, corr0); c3 = _mm256_sub_epi32(c3, corr1);
+    c4 = _mm256_sub_epi32(c4, corr0); c5 = _mm256_sub_epi32(c5, corr1);
+    c6 = _mm256_sub_epi32(c6, corr0); c7 = _mm256_sub_epi32(c7, corr1);
+    c8 = _mm256_sub_epi32(c8, corr0); c9 = _mm256_sub_epi32(c9, corr1);
+    c10 = _mm256_sub_epi32(c10, corr0); c11 = _mm256_sub_epi32(c11, corr1);
+    // --------------------------------------------------
+
     int32_t tmp[6][16] __attribute__((aligned(32)));
     _mm256_storeu_si256((__m256i*)&tmp[0][0], c0);
     _mm256_storeu_si256((__m256i*)&tmp[0][8], c1);
@@ -171,12 +190,16 @@ void kernel(int32_t M, int32_t N, int32_t K,
             int8_t* A, int LDA, int8_t* B, int LDB,
             int32_t* C, int LDC)
 {
-    int8_t* Local_Buffer_A   = (int8_t*)_mm_malloc((MC_PADDED(MC)+6)*KC, 64);
-    int8_t* Local_Buffer_B   = (int8_t*)_mm_malloc((NC_PADDED(NC)+16)*KC, 64);
+    int8_t* Local_Buffer_A = (int8_t*)_mm_malloc((MC_PADDED(MC)+6)*KC, 64);
+    int8_t* Local_Buffer_B = (int8_t*)_mm_malloc((NC_PADDED(NC)+16)*KC, 64);
+    
+    // Allocate thread-local correction buffer (only size of NC panel)
+    int32_t* Local_B_Corr  = (int32_t*)_mm_malloc(NC_PADDED(NC) * sizeof(int32_t), 64);
 
-    if (!Local_Buffer_A || !Local_Buffer_B) {
+    if (!Local_Buffer_A || !Local_Buffer_B || !Local_B_Corr) {
         if (Local_Buffer_A) _mm_free(Local_Buffer_A);
         if (Local_Buffer_B) _mm_free(Local_Buffer_B);
+        if (Local_B_Corr)   _mm_free(Local_B_Corr);
         return;
     }
 
@@ -186,8 +209,8 @@ void kernel(int32_t M, int32_t N, int32_t K,
         for (int p = 0; p < K; p += KC) {
             int kc = min(K-p, KC);
 
-            // Pass 7 args instead of 8 to pack_B now
-            pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB); 
+            // Pass the local correction buffer to be filled
+            pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB, Local_B_Corr); 
             int kc_padded = (kc+3) & ~3;
 
             for (int i = 0; i < M; i += MC) {
@@ -199,17 +222,20 @@ void kernel(int32_t M, int32_t N, int32_t K,
                     int nr = min(nc-jr, 16);
                     for (int ir = 0; ir < mc; ir += 6) {
                         int mr = min(mc-ir, 6);
+                        
+                        // Pass the specific 16-element correction block into the macro kernel
                         macro_kernel(mr, nr, kc,
                             &Local_Buffer_A[ir*kc_padded],
                             &Local_Buffer_B[jr*kc_padded],
-                            &C(i+ir, j+jr), LDC);
+                            &C(i+ir, j+jr), LDC, 
+                            &Local_B_Corr[jr]); 
                     }
                 }
             }
-            // Correction loop deleted entirely
         }
     }
 
     _mm_free(Local_Buffer_A);
     _mm_free(Local_Buffer_B);
+    _mm_free(Local_B_Corr);
 }

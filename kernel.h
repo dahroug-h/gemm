@@ -80,7 +80,7 @@ void pack_A(int8_t* __restrict A, int8_t* __restrict Buffer_A, int mc, int kc,
         int mr = min(6, mc - i);
         int p = 0;
         
-        // PURE SPEED: Fast XOR loop (Mathematically adds 128)
+        // PURE SPEED: Fast XOR loop
         for (; p + 3 < kc; p += 4) {
             for (int r = 0; r < mr; r++) {
                 *Buffer_A++ = A(row_start+i+r, col_start+p+0) ^ 0x80;
@@ -115,7 +115,6 @@ void pack_B(int8_t* __restrict B, int8_t* __restrict Buffer_B, int nc, int kc,
         int nr = min(16, nc - j);
         int p = 0;
         
-        // PURE SPEED: Memory copy only, absolutely no correction math inside
         for (; p + 3 < kc; p += 4) {
             for (int i = 0; i < nr; i++) {
                 *Buffer_B++ = B(row_start+p+0, col_start+j+i);
@@ -128,7 +127,6 @@ void pack_B(int8_t* __restrict B, int8_t* __restrict Buffer_B, int nc, int kc,
             }
         }
         
-        // Fringe loop
         if (p < kc) {
             for (int i = 0; i < nr; i++) {
                 *Buffer_B++ = (p+0<kc) ? B(row_start+p+0, col_start+j+i) : 0;
@@ -173,7 +171,6 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
         micro_kernel_6x16
     }
 
-    // PURE SPEED: Directly store results without any vector subtraction
     int32_t tmp[6][16] __attribute__((aligned(32)));
     _mm256_storeu_si256((__m256i*)&tmp[0][0], c0);
     _mm256_storeu_si256((__m256i*)&tmp[0][8], c1);
@@ -188,8 +185,9 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
     _mm256_storeu_si256((__m256i*)&tmp[5][0], c10);
     _mm256_storeu_si256((__m256i*)&tmp[5][8], c11);
 
-    for (int r = 0; r < M; r++)
-        for (int c = 0; c < N; c++)
+    // CRITICAL FIX: Loop order swapped to C(r, c) over contiguous memory
+    for (int c = 0; c < N; c++)
+        for (int r = 0; r < M; r++)
             C(r, c) += tmp[r][c];
 }
 
@@ -197,8 +195,6 @@ void kernel(int32_t M, int32_t N, int32_t K,
             int8_t* __restrict A, int LDA, int8_t* __restrict B, int LDB,
             int32_t* __restrict C, int LDC)
 {
-    // 1. FAST GLOBAL OFFSET PRE-CALCULATION
-    // B is column-major, so reading B(k, j) with k inside is perfectly contiguous
     int32_t* B_col_sum = (int32_t*)malloc(N * sizeof(int32_t));
     if (!B_col_sum) return;
     
@@ -211,7 +207,6 @@ void kernel(int32_t M, int32_t N, int32_t K,
         B_col_sum[j] = sum * 128; 
     }
 
-    // 2. THE PURE SPEED GEMM (OpenMP threading reverted to the safe, fast 'jr' loop)
     int8_t* Local_Buffer_A = (int8_t*)_mm_malloc((MC_PADDED(MC)+6)*KC, 64);
     int8_t* Local_Buffer_B = (int8_t*)_mm_malloc((NC_PADDED(NC)+16)*KC, 64);
 
@@ -233,7 +228,6 @@ void kernel(int32_t M, int32_t N, int32_t K,
                 int mc = min(M-i, MC);
                 pack_A(A, Local_Buffer_A, mc, kc, i, p, LDA);
 
-                // OpenMP threading restored to the safe zone!
                 PRAGMA_OMP_PARALLEL_FOR
                 for (int jr = 0; jr < nc; jr += 16) {
                     int nr = min(nc-jr, 16);
@@ -249,12 +243,19 @@ void kernel(int32_t M, int32_t N, int32_t K,
         }
     }
 
-    // 3. INSTANT GLOBAL CORRECTION (Cache-aware order!)
-    // C is column-major, so 'i' MUST be the inner loop to prevent Stride-of-Death
+    // CRITICAL FIX: AVX Vectorized Global Correction
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < N; j++) {
         int32_t corr = B_col_sum[j];
-        for (int i = 0; i < M; i++) {
+        __m256i v_corr = _mm256_set1_epi32(corr);
+        
+        int i = 0;
+        for (; i + 7 < M; i += 8) {
+            __m256i vc = _mm256_loadu_si256((__m256i*)&C(i, j));
+            vc = _mm256_sub_epi32(vc, v_corr);
+            _mm256_storeu_si256((__m256i*)&C(i, j), vc);
+        }
+        for (; i < M; i++) {
             C(i, j) -= corr;
         }
     }

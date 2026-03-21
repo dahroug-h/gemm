@@ -4,10 +4,10 @@
 - the range of parameters  " weights and activations "
 - Avx2 machines and why it is still a problem
 - why high range of int8 reduces the performance
-- code implementation beats onednn
+- code implementation beats onednn (commit "gemmm")
 - explain how
 - flex with you gemm optimization concepts
-- code implementation of higher range vs onednn
+- code implementation of higher range vs onednn "kernel done"
 - profilling and how we lost prformance and why
 - why we don't need that much range
-- conclusion
+- conclusionus

@@ -1,5 +1,6 @@
 #include <omp.h>
 #include "immintrin.h"
+#include <stdlib.h> // For malloc/free if needed, though we use _mm_malloc
 
 #define A(i,j) A[(i)+(j)*LDA]
 #define B(i,j) B[(i)+(j)*LDB]
@@ -80,10 +81,11 @@ void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc,
         int mr = min(6, mc - i);
         for (int p = 0; p < kc; p += 4) {
             for (int r = 0; r < mr; r++) {
-                *Buffer_A++ = (p+0<kc) ? A(row_start+i+r,col_start+p+0)+128 : 128;
-                *Buffer_A++ = (p+1<kc) ? A(row_start+i+r,col_start+p+1)+128 : 128;
-                *Buffer_A++ = (p+2<kc) ? A(row_start+i+r,col_start+p+2)+128 : 128;
-                *Buffer_A++ = (p+3<kc) ? A(row_start+i+r,col_start+p+3)+128 : 128;
+                // Direct copy, assumes A is already scaled/unsigned
+                *Buffer_A++ = (p+0<kc) ? A(row_start+i+r,col_start+p+0) : 0;
+                *Buffer_A++ = (p+1<kc) ? A(row_start+i+r,col_start+p+1) : 0;
+                *Buffer_A++ = (p+2<kc) ? A(row_start+i+r,col_start+p+2) : 0;
+                *Buffer_A++ = (p+3<kc) ? A(row_start+i+r,col_start+p+3) : 0;
             }
             for (int r = mr; r < 6; r++) {
                 *Buffer_A++ = 0; *Buffer_A++ = 0;
@@ -94,25 +96,19 @@ void pack_A(int8_t* A, int8_t* Buffer_A, int mc, int kc,
 }
 
 void pack_B(int8_t* B, int8_t* Buffer_B, int nc, int kc,
-            int col_start, int row_start, int LDB,
-            int32_t* B_col_correction)
+            int col_start, int row_start, int LDB)
 {
-    for (int x = 0; x < nc; x++)
-        B_col_correction[col_start + x] = 0;
-
     for (int j = 0; j < nc; j += 16) {
         int nr = min(16, nc - j);
         for (int p = 0; p < kc; p += 4) {
             for (int i = 0; i < nr; i++) {
+                // Direct copy, no correction factor math
                 int8_t v0 = (p+0<kc) ? B(row_start+p+0,col_start+j+i) : 0;
                 int8_t v1 = (p+1<kc) ? B(row_start+p+1,col_start+j+i) : 0;
                 int8_t v2 = (p+2<kc) ? B(row_start+p+2,col_start+j+i) : 0;
                 int8_t v3 = (p+3<kc) ? B(row_start+p+3,col_start+j+i) : 0;
                 *Buffer_B++ = v0; *Buffer_B++ = v1;
                 *Buffer_B++ = v2; *Buffer_B++ = v3;
-                B_col_correction[col_start+j+i] +=
-                    (int32_t)v0*128+(int32_t)v1*128+
-                    (int32_t)v2*128+(int32_t)v3*128;
             }
             for (int i = nr; i < 16; i++) {
                 *Buffer_B++ = 0; *Buffer_B++ = 0;
@@ -175,15 +171,12 @@ void kernel(int32_t M, int32_t N, int32_t K,
             int8_t* A, int LDA, int8_t* B, int LDB,
             int32_t* C, int LDC)
 {
-    int N_safe = ((N + 15) / 16) * 16;
-    int32_t* B_col_correction = (int32_t*)malloc(N_safe * sizeof(int32_t));
-    int8_t*  Local_Buffer_A   = (int8_t*)_mm_malloc((MC_PADDED(MC)+6)*KC, 64);
-    int8_t*  Local_Buffer_B   = (int8_t*)_mm_malloc((NC_PADDED(NC)+16)*KC, 64);
+    int8_t* Local_Buffer_A   = (int8_t*)_mm_malloc((MC_PADDED(MC)+6)*KC, 64);
+    int8_t* Local_Buffer_B   = (int8_t*)_mm_malloc((NC_PADDED(NC)+16)*KC, 64);
 
-    if (!Local_Buffer_A || !Local_Buffer_B || !B_col_correction) {
-        _mm_free(Local_Buffer_A);
-        _mm_free(Local_Buffer_B);
-        free(B_col_correction);
+    if (!Local_Buffer_A || !Local_Buffer_B) {
+        if (Local_Buffer_A) _mm_free(Local_Buffer_A);
+        if (Local_Buffer_B) _mm_free(Local_Buffer_B);
         return;
     }
 
@@ -193,10 +186,8 @@ void kernel(int32_t M, int32_t N, int32_t K,
         for (int p = 0; p < K; p += KC) {
             int kc = min(K-p, KC);
 
-            PRAGMA_OMP_PARALLEL_FOR
-            for (int x = 0; x < nc; x++) B_col_correction[j+x] = 0;
-
-            pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB, B_col_correction);
+            // Pass 7 args instead of 8 to pack_B now
+            pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB); 
             int kc_padded = (kc+3) & ~3;
 
             for (int i = 0; i < M; i += MC) {
@@ -215,18 +206,10 @@ void kernel(int32_t M, int32_t N, int32_t K,
                     }
                 }
             }
-
-            /* ── correction applied ONCE per KC panel ──
-             * after ALL MC blocks are done for this KC strip.
-             * Previously it was inside the MC loop which caused
-             * M/MC × overcorrection at large M — now fixed.     */
-            for (int i = 0; i < M; i++)
-                for (int c = 0; c < nc; c++)
-                    C(i, j+c) -= B_col_correction[j+c];
+            // Correction loop deleted entirely
         }
     }
 
     _mm_free(Local_Buffer_A);
     _mm_free(Local_Buffer_B);
-    free(B_col_correction);
 }

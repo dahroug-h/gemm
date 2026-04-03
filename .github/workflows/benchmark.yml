@@ -159,7 +159,7 @@ jobs:
       - name: Run Google Benchmark
         run: |
           source /opt/intel/oneapi/setvars.sh
-          g++ -O3 -march=native -fopenmp benchmarks/gemm_benchmark.cpp -o gemm_bench -lbenchmark -lpthread
+          g++ -O3 -march=native -fopenmp benchmarks/google_benchmark.cpp -o gemm_bench -lbenchmark -lpthread
           ./gemm_bench --benchmark_out=benchmark_results.json --benchmark_out_format=json
 
       # ── 12. Perf profiling ─────────────────────────────────────

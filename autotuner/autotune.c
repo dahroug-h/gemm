@@ -42,7 +42,7 @@ __thread int PFETCH_B_L2 = 2048;
 #define PREFETCH_B_L2 PFETCH_B_L2
 
 #undef min
-#include "./src/kernel.h"
+#include "src/kernel.h"
 
 /* ── config ── */
 #define COARSE_SIZE     1024

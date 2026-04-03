@@ -87,6 +87,7 @@ jobs:
       - name: Build autotuner
         run: |
           gcc autotuner/autotune.c \
+            -I. \
             -O3 -march=core-avx2 -mavx2 -mno-avx512f \
             -fopenmp \
             -DNTHREADS=$NCORES \

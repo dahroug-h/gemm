@@ -148,70 +148,7 @@ fprintf(fp, "Size,DNNL_GFLOPS,ME_GFLOPS\n");
     printf("ME:   %f GFLOPS  (%.1f%% of peak)\n", gflops_k, pct_peak);
 
     fprintf(fp, "%d,%f,%f\n", m, gflops, gflops_k);
-/*
-    dnnl_gemm_s8s8s32('N','N','F', m,n,k, 1.0f, A,m,ao, B,k,bo, 0.0f, C_dnnl,m,&oc);
-   
 
-    clock_t start_dnnl = clock();
-
-
-    dnnl_status_t status = dnnl_gemm_s8s8s32(
-    'N', 'N', 'F',//transA, transB, offsetC
-    (dnnl_dim_t)m, (dnnl_dim_t)n, (dnnl_dim_t)k,
-    1.0f,//C := alpha * (op(A) - A_offset) * (op(B) - B_offset) + beta * C + C_offset
-    A, m, ao,
-    B, k, bo,
-    0.0f,
-    C_dnnl, m, &oc);
-
-
-
-    //naive_matmul(A, B, C_naive, m, n, k);
-    clock_t end_dnnl = clock();
-
-    int32_t* C_warmup = (int32_t*)calloc(m*n, sizeof(int32_t));
-    kernel(m,n,k, A,m, B,k, C_warmup,m);
-    free(C_warmup);
-
-    clock_t start_kernel = clock();
-
-
-    kernel(m, n, k, A, m, B, k, C_kernel, m);
-
-    clock_t end_kernel = clock();
-    */
-  
-    
-   /* double time_dnnl = (double)(end_dnnl - start_dnnl) / CLOCKS_PER_SEC;
-    double time_kernel = (double)(end_kernel - start_kernel) / CLOCKS_PER_SEC;
-    double flops = 2.0 * m * n * k;
-    double gflops = flops / (time_dnnl * 1e9);
-
-    double gflops_k = flops / (time_kernel * 1e9);
-
-*/
-
-/*
-printf("[[[[[ %d x %d x %d ]]]]]\n", m, n, k);
-printf("DNNL: %f GFLOPS\n", gflops_dnnl);
-printf("ME: %f GFLOPS\n", gflops_kernel);
-fprintf(fp, "%d,%f,%f\n", m, gflops_dnnl, gflops_kernel);
-*/
-/*
-printf("[[[[[ %d x %d x %d ]]]]]\n", m, n, k);
-printf("DNNL: %f GFLOPS\n", gflops);
-printf("ME: %f GFLOPS\n", gflops_k);*/
-
-
-//fprintf(fp, "%d,%f,%f\n", m, gflops, gflops_k);
-
-
-
-    /*
-    printf("[[[[[ %d x %d x %d ]]]]]\n", m, n, k);
-    printf("DNNL: %f GFLOPS\n", gflops);
-    printf("ME: %f GFLOPS\n", gflops_k);
-*/
     free(A);
     free(B);
     free(C_dnnl);

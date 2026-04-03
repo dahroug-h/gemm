@@ -86,7 +86,7 @@ jobs:
       # ── 8. Build autotuner ─────────────────────────────────────
       - name: Build autotuner
         run: |
-          gcc autotune.c \
+          gcc autotune/autotune.c \
             -O3 -march=core-avx2 -mavx2 -mno-avx512f \
             -fopenmp \
             -DNTHREADS=$NCORES \
@@ -127,7 +127,7 @@ jobs:
           echo "  PREFETCH_A_L1=$BEST_PA1 PREFETCH_B_L1=$BEST_PB1"
           echo "  PREFETCH_A_L2=$BEST_PA2 PREFETCH_B_L2=$BEST_PB2"
           echo "  NTHREADS=$NCORES"
-          gcc -g -fopenmp matmul.c \
+          gcc -g -fopenmp src/matmul.c \
             -O3 -march=core-avx2 -mavx2 -mno-avx512f \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
             -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
@@ -187,7 +187,7 @@ jobs:
 
       # ── 13. Generate plot ──────────────────────────────────────
       - name: Generate performance plot
-        run: python3 plot.py
+        run: python3 scripts/plot.py
 
       # ── 14. Upload all artifacts ───────────────────────────────
       - name: Upload benchmark results

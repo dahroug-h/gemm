@@ -50,6 +50,12 @@ jobs:
           echo "=== Logical CPUs available: $NCORES ==="
           echo "NCORES=$NCORES" >> $GITHUB_ENV
           echo "OMP_NUM_THREADS=$NCORES" >> $GITHUB_ENV
+      # ── 4. Print CPU info + Setup Environment ────────────────
+      - name: Detect CPU and Set Env
+        run: |
+          CPU_NAME=$(lscpu | grep "Model name" | cut -d':' -f2 | xargs)
+          echo "CPU_MODEL=$CPU_NAME" >> $GITHUB_ENV
+          echo "Using CPU: $CPU_NAME"
 
       # ── 5. Install system dependencies + perf tools ───────────
       - name: Install system dependencies
@@ -204,7 +210,9 @@ jobs:
 
       # ── 13. Generate plot ──────────────────────────────────────
       - name: Generate performance plot
-        run: python3 scripts/plot.py
+        run: |
+          export CPU_MODEL="${{ env.CPU_MODEL }}"
+          python3 scripts/plot.py
 
       # ── 14. Upload all artifacts ───────────────────────────────
       - name: Upload benchmark results

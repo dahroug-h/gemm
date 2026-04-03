@@ -6,7 +6,6 @@
 #include "mkl.h"
 #include "kernel.h"
 #include <omp.h>
-//#include "kernel_packed_8x8.h"
 #include <stdbool.h>
 #include "dnnl.h"
 #include <string.h>

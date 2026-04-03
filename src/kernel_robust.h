@@ -2,9 +2,10 @@
 #include "immintrin.h"
 #include <stdlib.h>
 
-#define AR(i,j) A[(i)+(j)*LDA]
-#define BR(i,j) B[(i)+(j)*LDB]
-#define CR(i,j) C[(i)+(j)*LDC]
+// استعملنا _A و _B و _C عشان الـ Compiler ميتلخبطش بين الماكرو والمتغير اللي اسمه A أو B
+#define _A(i,j) A[(i)+(j)*LDA]
+#define _B(i,j) B[(i)+(j)*LDB]
+#define _C(i,j) C[(i)+(j)*LDC]
 
 #ifndef MC
 extern __thread int MC, NC, KC;
@@ -14,16 +15,14 @@ extern __thread int MC, NC, KC;
     #define NTHREADS omp_get_max_threads()
 #endif
 
-#ifndef OMP_SCHEDULE
-    #define OMP_SCHEDULE static
-#endif
+#define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(static) num_threads(NTHREADS)")
 
-#define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(OMP_SCHEDULE) num_threads(NTHREADS)")
-#define MC_PADDED(mc) (((mc + 5) / 6) * 6)
-#define NC_PADDED(nc) (((nc + 15) / 16) * 16)
+// تصحيح الماكرو بتاع الـ min
 #define min_val(a,b) (((a)<(b))?(a):(b))
 
-// Prefetching configuration (Crucial for Robustness)
+#define MC_PADDED(mc) (((mc + 5) / 6) * 6)
+#define NC_PADDED(nc) (((nc + 15) / 16) * 16)
+
 #ifndef PREFETCH_A_L1
     #define PREFETCH_A_L1  192
 #endif
@@ -31,7 +30,7 @@ extern __thread int MC, NC, KC;
     #define PREFETCH_B_L1  256
 #endif
 
-// --- ROBUST MICRO-KERNEL: 100% Correct for Full INT8 Range ---
+// الـ Robust Micro-kernel اللي بيحل مشكلة الـ +-28
 #define micro_kernel_6x16_robust \
     _mm_prefetch((const char*)(pa + PREFETCH_A_L1), _MM_HINT_T0); \
     _mm_prefetch((const char*)(pb + PREFETCH_B_L1), _MM_HINT_T0); \
@@ -40,11 +39,8 @@ extern __thread int MC, NC, KC;
     __m256i ones = _mm256_set1_epi16(1); \
     for (int r = 0; r < 6; r++) { \
         __m256i a = _mm256_set1_epi32(*(int32_t*)(pa + r * 4)); \
-        /* Step 1: Multiply u8*s8 -> s16 */ \
         __m256i m0 = _mm256_maddubs_epi16(a, b0); \
         __m256i m1 = _mm256_maddubs_epi16(a, b1); \
-        /* Step 2: Widening to 32-bit immediately */ \
-        /* This prevents the 16-bit saturation where oneDNN fails */ \
         if (r==0) { c0=_mm256_add_epi32(c0,_mm256_madd_epi16(m0,ones)); c1=_mm256_add_epi32(c1,_mm256_madd_epi16(m1,ones)); } \
         if (r==1) { c2=_mm256_add_epi32(c2,_mm256_madd_epi16(m0,ones)); c3=_mm256_add_epi32(c3,_mm256_madd_epi16(m1,ones)); } \
         if (r==2) { c4=_mm256_add_epi32(c4,_mm256_madd_epi16(m0,ones)); c5=_mm256_add_epi32(c5,_mm256_madd_epi16(m1,ones)); } \
@@ -53,7 +49,7 @@ extern __thread int MC, NC, KC;
         if (r==5) { c10=_mm256_add_epi32(c10,_mm256_madd_epi16(m0,ones)); c11=_mm256_add_epi32(c11,_mm256_madd_epi16(m1,ones)); } \
     } pa += 24; k += 4;
 
-    void pack_A(int8_t* __restrict A, int8_t* __restrict Buffer_A, int mc, int kc,
+void pack_A(int8_t* __restrict A, int8_t* __restrict Buffer_A, int mc, int kc,
             int row_start, int col_start, int LDA)
 {
     for (int i = 0; i < mc; i += 6) {

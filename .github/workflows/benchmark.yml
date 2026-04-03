@@ -55,12 +55,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y gcc libgomp1 python3-pip libdnnl-dev \
-            linux-tools-common linux-tools-generic linux-tools-$(uname -r) || \
-          sudo apt-get install -y linux-tools-common linux-tools-generic
+          sudo apt-get install -y gcc g++ libgomp1 python3-pip libdnnl-dev \
+            libbenchmark-dev \
+            linux-tools-common linux-tools-generic linux-tools-$(uname -r)
           sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
-
       # ── 6. Install Intel MKL (skipped if cached) ───────────────
       - name: Install Intel MKL
         if: steps.cache-mkl.outputs.cache-hit != 'true'
@@ -154,13 +153,22 @@ jobs:
           echo ""
           ./matmul | tee benchmark_output.txt
 
-
-      # -- Add this after Step 11 in your YAML --
-      - name: Run Google Benchmark
+     # ── NEW STEP: Build and Run Google Benchmark ──────────────
+      - name: Build and Run Google Benchmark
         run: |
           source /opt/intel/oneapi/setvars.sh
-          g++ -O3 -march=native -fopenmp benchmarks/google_benchmark.cpp -o gemm_bench -lbenchmark -lpthread
-          ./gemm_bench --benchmark_out=benchmark_results.json --benchmark_out_format=json
+          # Use g++ for the benchmark file, linking -lbenchmark and -lpthread
+          g++ -O3 -march=core-avx2 -fopenmp \
+            benchmarks/google_benchmark.cpp -o google_bench \
+            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
+            -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
+            -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
+            -I./src -I$MKLROOT/include \
+            -L$MKLROOT/lib/intel64 \
+            -lbenchmark -lpthread -lm
+          
+          # Run it and output to the terminal
+          ./google_bench
 
       # ── 12. Perf profiling ─────────────────────────────────────
       - name: Profile kernel bottleneck

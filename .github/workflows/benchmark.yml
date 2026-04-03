@@ -1,4 +1,4 @@
-name: Benchmark Matmul (AVX2-only, Any CPU)
+name: Benchmark Matmul (AVX2-only, Industry Standard)
 
 on:
   push:
@@ -31,31 +31,19 @@ jobs:
           key: mkl-oneapi-ubuntu22-2024
           restore-keys: mkl-oneapi-ubuntu22-
 
-      # ── 4. Print CPU info + detect thread count ────────────────
-      - name: Print CPU info and detect threads
+      # ── 4. Detect CPU and Set Env ──────────────────────────────
+      - name: Print CPU info and Setup Environment
         run: |
           echo "=== CPU Model ==="
-          lscpu | grep "Model name"
-          echo ""
-          echo "=== Cache sizes ==="
-          lscpu | grep -i cache
-          echo ""
-          echo "=== Cores / Threads ==="
-          lscpu | grep -E "^CPU\(s\)|Thread|Core"
-          echo ""
-          echo "=== AVX flags present ==="
-          grep -o 'avx[^ ]*' /proc/cpuinfo | sort -u | head -20
-          echo ""
-          NCORES=$(nproc)
-          echo "=== Logical CPUs available: $NCORES ==="
-          echo "NCORES=$NCORES" >> $GITHUB_ENV
-          echo "OMP_NUM_THREADS=$NCORES" >> $GITHUB_ENV
-      # ── 4. Print CPU info + Setup Environment ────────────────
-      - name: Detect CPU and Set Env
-        run: |
           CPU_NAME=$(lscpu | grep "Model name" | cut -d':' -f2 | xargs)
           echo "CPU_MODEL=$CPU_NAME" >> $GITHUB_ENV
           echo "Using CPU: $CPU_NAME"
+          echo ""
+          echo "=== Cores / Threads ==="
+          NCORES=$(nproc)
+          echo "Logical CPUs available: $NCORES"
+          echo "NCORES=$NCORES" >> $GITHUB_ENV
+          echo "OMP_NUM_THREADS=$NCORES" >> $GITHUB_ENV
 
       # ── 5. Install system dependencies + perf tools ───────────
       - name: Install system dependencies
@@ -66,6 +54,7 @@ jobs:
             linux-tools-common linux-tools-generic linux-tools-$(uname -r)
           sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
+
       # ── 6. Install Intel MKL (skipped if cached) ───────────────
       - name: Install Intel MKL
         if: steps.cache-mkl.outputs.cache-hit != 'true'
@@ -79,7 +68,7 @@ jobs:
           sudo apt-get install -y intel-oneapi-mkl-devel
           echo "✅ MKL installed"
 
-      - name: Setup MKL (always needed even when cached)
+      - name: Setup MKL
         run: |
           echo "✅ MKL ready at /opt/intel/oneapi"
           ls /opt/intel/oneapi/setvars.sh
@@ -88,95 +77,66 @@ jobs:
       - name: Install Python packages
         run: pip3 install matplotlib numpy pandas
 
-      # ── 8. Build autotuner ─────────────────────────────────────
+      # ── 8. Build and Run Autotuner ─────────────────────────────
       - name: Build autotuner
         run: |
           gcc autotuner/autotune.c \
-            -I. \
-            -O3 -march=core-avx2 -mavx2 -mno-avx512f \
-            -fopenmp \
-            -DNTHREADS=$NCORES \
+            -I. -O3 -march=core-avx2 -mavx2 -mno-avx512f \
+            -fopenmp -DNTHREADS=$NCORES \
             -o autotune -lm -lpthread
-          echo "✅ autotune compiled with NTHREADS=$NCORES"
 
-      # ── 9. Run autotuner ───────────────────────────────────────
-      #    Phase 1: coarse MC/NC/KC
-      #    Phase 2: fine MC/NC/KC (harmonic mean N=512,1024,2048)
-      #    Phase 3: prefetch sweep (25 combos PA×PB)
-      #    Writes 7 values to /tmp/autotune_result.txt:
-      #      MC NC KC PA_L1 PB_L1 PA_L2 PB_L2
       - name: Run autotuner
         run: |
           export OMP_NUM_THREADS=$NCORES
-          echo "Starting autotune (MC/NC/KC + prefetch) with $NCORES threads..."
           ./autotune 2>&1 | tee autotune_log.txt
-          echo ""
-          echo "=== Autotune result (7 values) ==="
-          cat /tmp/autotune_result.txt
-          read BEST_MC BEST_NC BEST_KC BEST_PA1 BEST_PB1 BEST_PA2 BEST_PB2 \
-            < /tmp/autotune_result.txt
-          echo "BEST_MC=$BEST_MC"   >> $GITHUB_ENV
-          echo "BEST_NC=$BEST_NC"   >> $GITHUB_ENV
-          echo "BEST_KC=$BEST_KC"   >> $GITHUB_ENV
+          read BEST_MC BEST_NC BEST_KC BEST_PA1 BEST_PB1 BEST_PA2 BEST_PB2 < /tmp/autotune_result.txt
+          echo "BEST_MC=$BEST_MC" >> $GITHUB_ENV
+          echo "BEST_NC=$BEST_NC" >> $GITHUB_ENV
+          echo "BEST_KC=$BEST_KC" >> $GITHUB_ENV
           echo "BEST_PA1=$BEST_PA1" >> $GITHUB_ENV
           echo "BEST_PB1=$BEST_PB1" >> $GITHUB_ENV
           echo "BEST_PA2=$BEST_PA2" >> $GITHUB_ENV
           echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
 
-      # ── 10. Compile matmul ─────────────────────────────────────
-      #    All 7 autotuned values passed as -D flags
-      - name: Compile matmul
+      # ── 9. Compile and Run Custom Benchmark (matmul.c) ─────────
+      - name: Compile and Run Custom Benchmark
         run: |
           source /opt/intel/oneapi/setvars.sh
-          echo "Compiling with:"
-          echo "  MC=$BEST_MC NC=$BEST_NC KC=$BEST_KC"
-          echo "  PREFETCH_A_L1=$BEST_PA1 PREFETCH_B_L1=$BEST_PB1"
-          echo "  PREFETCH_A_L2=$BEST_PA2 PREFETCH_B_L2=$BEST_PB2"
-          echo "  NTHREADS=$NCORES"
           gcc -g -fopenmp src/matmul.c \
             -O3 -march=core-avx2 -mavx2 -mno-avx512f \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
             -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
             -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
             -DNTHREADS=$NCORES \
-            -I$MKLROOT/include \
-            -L$MKLROOT/lib/intel64 \
-            -lmkl_rt -ldnnl -lpthread -lm -ldl \
-            -o matmul
-          echo "✅ matmul compiled (AVX2-only, $NCORES threads)"
+            -I$MKLROOT/include -L$MKLROOT/lib/intel64 \
+            -lmkl_rt -ldnnl -lpthread -lm -ldl -o matmul
+          
+          export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
+          export DNNL_MAX_CPU_ISA=AVX2
+          export OMP_NUM_THREADS=$NCORES
+          ./matmul | tee benchmark_output.txt
 
-      # ── 11. Run benchmark ──────────────────────────────────────
-      - name: Run benchmark
+      # ── 10. Build and Run Google Benchmark ─────────────────────
+      - name: Build and Run Google Benchmark
         run: |
           source /opt/intel/oneapi/setvars.sh
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
           export DNNL_MAX_CPU_ISA=AVX2
           export OMP_NUM_THREADS=$NCORES
-          echo "=== Machine ==="
-          lscpu | grep "Model name"
-          echo "=== Threads: $NCORES ==="
-          echo "=== Both kernel and oneDNN: AVX2-only ==="
-          echo ""
-          ./matmul | tee benchmark_output.txt
 
-     # ── NEW STEP: Build and Run Google Benchmark ──────────────
-      - name: Build and Run Google Benchmark
-        run: |
-          source /opt/intel/oneapi/setvars.sh
-          # Use g++ for the benchmark file, linking -lbenchmark and -lpthread
+          # تم إضافة -ldnnl عشان يقدر يقرأ دوال إنتل للمقارنة
           g++ -O3 -march=core-avx2 -fopenmp \
             benchmarks/google_benchmark.cpp -o google_bench \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
             -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
             -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
-            -I./src -I$MKLROOT/include \
-            -L$MKLROOT/lib/intel64 \
-            -lbenchmark -lpthread -lm
+            -I./src -I$MKLROOT/include -L$MKLROOT/lib/intel64 \
+            -lbenchmark -ldnnl -lpthread -lm
           
-          # Run it and output to the terminal
-          ./google_bench
+          # استخراج النتائج في ملف JSON
+          ./google_bench --benchmark_out=google_results.json --benchmark_out_format=json
 
-      # ── 12. Perf profiling ─────────────────────────────────────
+      # ── 11. Perf profiling ─────────────────────────────────────
       - name: Profile kernel bottleneck
         run: |
           source /opt/intel/oneapi/setvars.sh
@@ -184,44 +144,34 @@ jobs:
           export DNNL_MAX_CPU_ISA=AVX2
           export OMP_NUM_THREADS=$NCORES
 
-          perf record -g --call-graph=dwarf -o perf.data ./matmul \
-            2>/dev/null || true
-
+          perf record -g --call-graph=dwarf -o perf.data ./matmul 2>/dev/null || true
+          
           echo "=== TOP FUNCTIONS ===" | tee perf_report.txt
           perf report --stdio --no-children -i perf.data 2>/dev/null \
             | grep -E "macro_kernel|pack_A|pack_B|kernel\b" \
             | grep -v "dnnl\|mkl\|gomp\|libc\|clone\|start" \
             | head -15 | tee -a perf_report.txt
 
-          echo "" | tee -a perf_report.txt
-          echo "=== INSIDE macro_kernel ===" | tee -a perf_report.txt
-          perf report --stdio --no-children -i perf.data 2>/dev/null \
-            | grep -A 30 "macro_kernel" \
-            | grep -E "maddubs|madd_epi|add_epi|loadu|set1|storeu|prefetch|\%" \
-            | head -20 | tee -a perf_report.txt
+          perf stat -e cycles,instructions,L1-dcache-load-misses,LLC-load-misses \
+            ./matmul 2>&1 | grep -E "cycles|instructions|insn|L1|LLC" | tee -a perf_report.txt
 
-          echo "" | tee -a perf_report.txt
-          echo "=== PERF STAT ===" | tee -a perf_report.txt
-          perf stat \
-            -e cycles,instructions,L1-dcache-load-misses,LLC-load-misses \
-            ./matmul 2>&1 \
-            | grep -E "cycles|instructions|insn|L1|LLC" \
-            | tee -a perf_report.txt
-
-      # ── 13. Generate plot ──────────────────────────────────────
-      - name: Generate performance plot
+      # ── 12. Generate All Plots ─────────────────────────────────
+      - name: Generate performance plots
         run: |
           export CPU_MODEL="${{ env.CPU_MODEL }}"
           python3 scripts/plot.py
+          python3 scripts/plot_google.py
 
-      # ── 14. Upload all artifacts ───────────────────────────────
+      # ── 13. Upload all artifacts ───────────────────────────────
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results-avx2-only
+          name: benchmark-professional-results
           path: |
             autotune_log.txt
             benchmark_output.txt
             benchmark_results.csv
+            google_results.json
             performance_plot.png
+            google_bench_plot.png
             perf_report.txt

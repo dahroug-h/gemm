@@ -78,7 +78,7 @@ jobs:
       # ── 9. Compile Both Kernels (Standard & Robust) ────────────
       - name: Compile matmul binaries
         run: |
-         source /opt/intel/oneapi/setvars.sh --force
+          source /opt/intel/oneapi/setvars.sh --force || [[ $? -eq 40 ]]
           # 1. Compile Standard version
           gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
@@ -99,7 +99,7 @@ jobs:
       # ── 10. Run All Benchmarks ─────────────────────────────────
       - name: Run matmul benchmarks
         run: |
-          source /opt/intel/oneapi/setvars.sh --force || true
+          source /opt/intel/oneapi/setvars.sh --force || [[ $? -eq 40 ]]
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
           export OMP_NUM_THREADS=$NCORES
           
@@ -114,7 +114,7 @@ jobs:
       # ── 11. Google Benchmark (With Robustness Test) ───────────
       - name: Run Google Benchmark
         run: |
-          source /opt/intel/oneapi/setvars.sh --force
+          source /opt/intel/oneapi/setvars.sh --force || [[ $? -eq 40 ]]
           g++ -O3 -march=core-avx2 -fopenmp benchmarks/google_benchmark.cpp -o google_bench \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC -I./src -I$MKLROOT/include \
             -L$MKLROOT/lib/intel64 -lbenchmark -ldnnl -lpthread -lm
@@ -125,7 +125,7 @@ jobs:
       # ── 12. Profiling & Plots ──────────────────────────────────
       - name: Profile and Plot
         run: |
-          source /opt/intel/oneapi/setvars.sh
+          source /opt/intel/oneapi/setvars.sh --force || [[ $? -eq 40 ]]
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
           perf stat ./matmul 2>&1 | tee perf_report.txt
           export CPU_MODEL="${{ env.CPU_MODEL }}"

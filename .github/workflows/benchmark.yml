@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  # حل مشكلة Node.js Deprecation اللي ظهرت في الـ Logs
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   benchmark:
     runs-on: ubuntu-22.04
@@ -57,15 +61,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
 
-      # ── 7. تثبيت بيئة oneAPI (الحل الجذري والنهائي) ──────────────
-      - name: Setup and Persist oneAPI Environment
+      # ── 7. التقاط المتغيرات لمرة واحدة (The Engineer Way) ─────────
+      - name: Capture oneAPI Environment
         run: |
-          # نستخدم Bash منفصل لاستخراج المتغيرات لضمان عدم تأثر الـ Runner لو حدث exit 40
-          # نقوم بحفظ المتغيرات الأساسية في GITHUB_ENV لتصبح متاحة في كل الخطوات التالية تلقائياً
+          # استخراج المسارات وحفظها في بيئة GitHub للأبد
           bash -c "source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1; env" | grep -E "MKLROOT|CPATH|LIBRARY_PATH" >> $GITHUB_ENV
-          
-          # إضافة يدوية لمسارات المكتبات لضمان عمل الـ Dynamic Linker وقت التشغيل
-          echo "LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64:/opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          # تعريف مسار المكتبات الصريح لاستخدامه في الـ RPATH
+          echo "MKL_LIB_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64" >> $GITHUB_ENV
 
       # ── 8. Install Python packages ─────────────────────────────
       - name: Install Python packages
@@ -85,50 +87,43 @@ jobs:
           echo "BEST_PA2=$BEST_PA2" >> $GITHUB_ENV
           echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
 
-      # ── 10. بناء الأنوية (Standard & Robust) ────────────────────
+      # ── 10. الـ Compilation باستخدام الـ RPATH (الحل الجذري) ──────
       - name: Compile matmul binaries
         run: |
-          # لا حاجة لـ source هنا! المتغيرات محملة بالفعل في البيئة
+          # التعديل هنا: إضافة -Wl,-rpath لحقن المسار داخل الـ Binary
+          COMMON_FLAGS="-g -fopenmp -O3 -march=core-avx2 -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 -I$MKLROOT/include -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH -lmkl_rt -ldnnl"
           
-          # 1. بناء النسخة القياسية
-          gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \
-            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
-            -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
-            -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
-            -I$MKLROOT/include -L$MKLROOT/lib/intel64 -lmkl_rt -ldnnl -o matmul
+          # بناء النسخة القياسية
+          gcc src/matmul.c $COMMON_FLAGS -o matmul
           
-          # 2. بناء النسخة الـ Robust باستخدام الـ 242 سطر
+          # بناء النسخة الـ Robust باستخدام الـ 242 سطر
           mv src/kernel.h src/kernel_std.h
           cp src/kernel_robust.h src/kernel.h
-          gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \
-            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
-            -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
-            -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
-            -I$MKLROOT/include -L$MKLROOT/lib/intel64 -lmkl_rt -ldnnl -o matmul_robust
+          gcc src/matmul.c $COMMON_FLAGS -o matmul_robust
           mv src/kernel_std.h src/kernel.h
 
-      # ── 11. تشغيل الاختبارات ───────────────────────────────────
+      # ── 11. تشغيل الـ Benchmarks (مباشرة وبأمان) ────────────────
       - name: Run matmul benchmarks
         run: |
+          # الـ Binary دلوقتي "عارف" طريقه ومحتاج بس الـ Threads
           export OMP_NUM_THREADS=$NCORES
-          # تشغيل النسخة القياسية
+          
           ./matmul > standard_output.txt
           mv benchmark_results.csv standard_results.csv
           
-          # تشغيل النسخة الـ Robust
           ./matmul_robust > robust_output.txt
           mv benchmark_results.csv robust_results.csv
 
-      # ── 12. Google Benchmark (اختبار الدقة) ────────────────────
+      # ── 12. Google Benchmark ──────────────────────────────────
       - name: Run Google Benchmark
         run: |
           g++ -O3 -march=core-avx2 -fopenmp benchmarks/google_benchmark.cpp -o google_bench \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC -I./src -I$MKLROOT/include \
-            -L$MKLROOT/lib/intel64 -lbenchmark -ldnnl -lpthread -lm
+            -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH -lbenchmark -ldnnl -lpthread -lm
           ./google_bench --benchmark_out=google_results.json --benchmark_out_format=json \
             --benchmark_filter="BM_MyKernel|BM_OneDNN|BM_ExtremeRange_Accuracy"
 
-      # ── 13. التوصيف والرسوم البيانية ────────────────────────────
+      # ── 13. Profiling & Plots ──────────────────────────────────
       - name: Profile and Plot
         run: |
           perf stat ./matmul 2>&1 | tee perf_report.txt
@@ -136,7 +131,7 @@ jobs:
           python3 scripts/plot.py
           python3 scripts/plot_google.py
 
-      # ── 14. رفع النتائج ────────────────────────────────────────
+      # ── 14. Upload Results ─────────────────────────────────────
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:

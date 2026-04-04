@@ -71,39 +71,24 @@ jobs:
 
       # ── 7. Capture oneAPI Environment ──────────────────────────
       #
-      #    ROOT CAUSE (confirmed by diagnostic):
-      #    No profile.d hook exists — Intel doesn't install one on this
-      #    runner image. The exit 40 comes from setvars.sh itself during
-      #    the child process execution, because `bash --norc --noprofile`
-      #    still INHERITS the parent shell's exported environment. If
-      #    SETVARS_COMPLETED (or any partial oneAPI var) is already
-      #    exported in the parent (e.g. from a prior cache-restored run
-      #    or a GitHub Actions env injection), setvars.sh sees it and
-      #    calls `exit 40` even though we pass --force, because in
-      #    oneAPI 2025.x the sub-scripts (mkl/env/vars.sh, etc.) each
-      #    have their own `exit` guard that --force does not suppress.
+      #    env -i gives the child a fully blank environment so
+      #    setvars.sh sees zero sentinels and runs cleanly.
+      #    We then diff the child env against the parent snapshot
+      #    and persist only the delta to $GITHUB_ENV.
       #
-      #    FIX: Use `env -i` to launch the child with a completely blank
-      #    environment — zero inherited vars. We reconstruct only the
-      #    minimal env needed for bash and setvars.sh to function:
-      #      HOME, PATH (system only), TERM.
-      #    setvars.sh then sees no sentinels whatsoever and runs cleanly.
-      #    We capture its output env, diff against the real parent env,
-      #    and write only new/changed vars to $GITHUB_ENV.
+      #    IMPORTANT: we do NOT persist LD_LIBRARY_PATH into
+      #    GITHUB_ENV. Our binaries embed the MKL rpath via
+      #    -Wl,-rpath at compile time, so LD_LIBRARY_PATH is
+      #    redundant for runtime — and keeping it causes MKL's
+      #    own shell-init hooks to fire when any subprocess is
+      #    spawned, retriggering exit 40 in later steps.
+      #    MKLROOT + the compile-time rpath is all we need.
       - name: Capture oneAPI Environment
         shell: bash
         run: |
-          # Snapshot the REAL parent environment before any sourcing
           SNAP_BEFORE=$(mktemp)
           env | sort > "$SNAP_BEFORE"
 
-          # Launch child with a completely blank environment via env -i.
-          # Only inject the bare minimum for bash + setvars.sh to work:
-          #   HOME        — setvars.sh reads this for user config paths
-          #   PATH        — system PATH only, no Intel paths yet
-          #   TERM        — prevents tput warnings in sub-scripts
-          # Every oneAPI sentinel (SETVARS_COMPLETED, SETVARS_STARTED,
-          # MKLROOT, etc.) is absent because we start from zero.
           CHILD_ENV=$(
             env -i \
               HOME="$HOME" \
@@ -115,29 +100,27 @@ jobs:
               '
           )
           CHILD_EXIT=$?
-
-          # Any non-zero exit here is a genuine failure — with env -i and
-          # no sentinels present, setvars.sh has no reason to exit 40.
           if [ $CHILD_EXIT -ne 0 ]; then
             echo "ERROR: setvars.sh failed with exit code $CHILD_EXIT"
-            echo "--- child env output (for debugging) ---"
             echo "$CHILD_ENV"
             exit $CHILD_EXIT
           fi
 
-          # Write child env to temp file for diffing
           SNAP_AFTER=$(mktemp)
           echo "$CHILD_ENV" | sort > "$SNAP_AFTER"
 
-          # comm -13: lines ONLY in AFTER = vars added/changed by setvars.sh
-          # Write each to $GITHUB_ENV using heredoc multiline syntax —
-          # the only form safe for values containing '=' (like PATH=a:b:c).
           comm -13 "$SNAP_BEFORE" "$SNAP_AFTER" | while IFS= read -r LINE; do
             KEY="${LINE%%=*}"
             VALUE="${LINE#*=}"
-            # Skip bash process internals that are child-specific
             case "$KEY" in
+              # Skip child-specific bash internals
               BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD|TERM|HOME) continue ;;
+              # CRITICAL: Do NOT export LD_LIBRARY_PATH or LIBRARY_PATH.
+              # Binaries use -Wl,-rpath so these are not needed at runtime.
+              # Exporting them causes MKL sub-scripts to be sourced by any
+              # child process that inspects its own library environment,
+              # which re-triggers setvars.sh and produces exit 40.
+              LD_LIBRARY_PATH|LIBRARY_PATH) continue ;;
             esac
             printf '%s<<%s\n%s\n%s\n' \
               "$KEY" "__ONEAPI_DELIM__" "$VALUE" "__ONEAPI_DELIM__" \
@@ -146,8 +129,7 @@ jobs:
 
           rm -f "$SNAP_BEFORE" "$SNAP_AFTER"
 
-          # Derive MKL_LIB_PATH dynamically from MKLROOT so we never
-          # hardcode the intel64/x86_64 architecture suffix.
+          # Derive MKL_LIB_PATH from MKLROOT for use in -L and -rpath flags
           MKL_ROOT_VAL=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)
           if [ -n "$MKL_ROOT_VAL" ]; then
             MKL_LIB=$(find "$MKL_ROOT_VAL/lib" -maxdepth 1 -type d \
@@ -155,8 +137,14 @@ jobs:
             [ -n "$MKL_LIB" ] && echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
           fi
 
-          echo "oneAPI environment captured successfully."
-          echo "MKLROOT=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)"
+          # Also set SETVARS_COMPLETED so any accidental future source
+          # of setvars.sh returns immediately via `return` (not exit).
+          # We set it here explicitly so it is in the parent env —
+          # if setvars.sh ever does get sourced again it will hit the
+          # `return 0` path, not the `exit 40` path.
+          echo "SETVARS_COMPLETED=1" >> "$GITHUB_ENV"
+
+          echo "oneAPI environment captured. MKLROOT=$MKL_ROOT_VAL"
 
       # ── 8. Install Python packages ─────────────────────────────
       - name: Install Python packages
@@ -197,8 +185,19 @@ jobs:
           mv src/kernel_std.h src/kernel.h
 
       # ── 11. Run matmul benchmarks ──────────────────────────────
+      #
+      #    We explicitly unset LD_LIBRARY_PATH and LIBRARY_PATH here
+      #    as a belt-and-suspenders measure. The -Wl,-rpath baked into
+      #    the binary handles runtime linking. Unsetting these vars
+      #    ensures no MKL sub-script can be triggered by the dynamic
+      #    linker or by libmkl_rt's internal init routines.
+      #    SETVARS_COMPLETED=1 is also set to make any accidental
+      #    setvars.sh invocation take the safe `return` path.
       - name: Run matmul benchmarks
+        env:
+          SETVARS_COMPLETED: "1"
         run: |
+          unset LD_LIBRARY_PATH LIBRARY_PATH
           export OMP_NUM_THREADS=$NCORES
           ./matmul        > standard_output.txt
           mv benchmark_results.csv standard_results.csv
@@ -207,7 +206,10 @@ jobs:
 
       # ── 12. Google Benchmark ───────────────────────────────────
       - name: Run Google Benchmark
+        env:
+          SETVARS_COMPLETED: "1"
         run: |
+          unset LD_LIBRARY_PATH LIBRARY_PATH
           g++ -O3 -march=core-avx2 -fopenmp \
             benchmarks/google_benchmark.cpp -o google_bench \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
@@ -221,7 +223,10 @@ jobs:
 
       # ── 13. Profiling and Plots ────────────────────────────────
       - name: Profile and Plot
+        env:
+          SETVARS_COMPLETED: "1"
         run: |
+          unset LD_LIBRARY_PATH LIBRARY_PATH
           perf stat ./matmul > perf_report.txt 2>&1 || true
           export CPU_MODEL="${{ env.CPU_MODEL }}"
           python3 scripts/plot.py

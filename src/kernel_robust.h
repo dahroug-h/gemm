@@ -2,11 +2,7 @@
 #include "immintrin.h"
 #include <stdlib.h>
 
-/* * ROBUST KERNEL - Numerical Integrity for Full INT8 Range [-128, 127]
- * Corrects AVX2 16-bit intermediate saturation issues.
- */
-
-// Macros mapped to renamed arguments to avoid "Shadowing" errors
+// الماكروس مرتبطة بالأسماء الجديدة للباراميترز لمنع الـ Shadowing
 #define A(i,j) _arg_A[(i)+(j)*LDA]
 #define B(i,j) _arg_B[(i)+(j)*LDB]
 #define C(i,j) _arg_C[(i)+(j)*LDC]
@@ -28,7 +24,6 @@ extern __thread int MC, NC, KC;
 #define MC_PADDED(mc) (((mc + 5) / 6) * 6)
 #define NC_PADDED(nc) (((nc + 15) / 16) * 16)
 
-// Correcting the implicit declaration warning
 #ifndef min
     #define min(a,b) (((a)<(b))?(a):(b))
 #endif
@@ -46,7 +41,7 @@ extern __thread int MC, NC, KC;
     #define PREFETCH_B_L2  1024
 #endif
 
-// Robust Micro-kernel: Widens to 32-bit IMMEDIATELY after maddubs
+// الـ Robust Micro-kernel: Widening to 32-bit IMMEDIATELY
 #define micro_kernel_6x16_robust \
     _mm_prefetch((const char*)(pa + PREFETCH_A_L1), _MM_HINT_T0); \
     _mm_prefetch((const char*)(pa + PREFETCH_A_L2), _MM_HINT_T1); \
@@ -182,7 +177,7 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
             C(r, c) += tmp[r][c];
 }
 
-void kernel_robust(int32_t M, int32_t N, int32_t K,
+void kernel(int32_t M, int32_t N, int32_t K,
             int8_t* __restrict _arg_A, int LDA, int8_t* __restrict _arg_B, int LDB,
             int32_t* __restrict _arg_C, int LDC)
 {

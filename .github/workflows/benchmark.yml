@@ -6,7 +6,6 @@ on:
   workflow_dispatch:
 
 env:
-  # حل مشكلة Node.js Deprecation اللي ظهرت في الـ Logs
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -32,7 +31,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/intel/oneapi
-          key: mkl-oneapi-ubuntu22-2024
+          key: mkl-oneapi-ubuntu22-2025
           restore-keys: mkl-oneapi-ubuntu22-
 
       # ── 4. Detect CPU and Set Env ──────────────────────────────
@@ -40,34 +39,121 @@ jobs:
         run: |
           CPU_NAME=$(lscpu | grep "Model name" | cut -d':' -f2 | xargs)
           echo "CPU_MODEL=$CPU_NAME" >> $GITHUB_ENV
-          echo "NCORES=$(nproc)" >> $GITHUB_ENV
+          echo "NCORES=$(nproc)"     >> $GITHUB_ENV
 
-      # ── 5. Install system dependencies + perf tools ───────────
+      # ── 5. Install system dependencies ────────────────────────
+      #    NOTE: perf requires the exact running kernel's tools package.
+      #    On GitHub Actions the kernel version changes per runner image,
+      #    so we install linux-tools-generic as a reliable fallback and
+      #    symlink /usr/bin/perf to it. Hardware counters may be limited
+      #    inside the VM but perf stat will still run.
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y gcc g++ libgomp1 python3-pip libdnnl-dev \
-            libbenchmark-dev linux-tools-common linux-tools-generic linux-tools-$(uname -r)
+          sudo apt-get install -y \
+            gcc g++ libgomp1 python3-pip \
+            libdnnl-dev libbenchmark-dev \
+            linux-tools-common linux-tools-generic
+          # Make 'perf' resolvable regardless of exact kernel version
+          if ! command -v perf &>/dev/null; then
+            PERF_BIN=$(find /usr/lib/linux-tools -name perf 2>/dev/null | head -1)
+            [ -n "$PERF_BIN" ] && sudo ln -sf "$PERF_BIN" /usr/local/bin/perf
+          fi
           sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
 
       # ── 6. Install Intel MKL (skipped if cached) ───────────────
+      #    Uses the modern signed-by keyring method (apt-key is deprecated
+      #    on Ubuntu 22.04 and prints warnings that pollute logs).
       - name: Install Intel MKL
         if: steps.cache-mkl.outputs.cache-hit != 'true'
         run: |
-          wget -q https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
-          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
-          echo "deb https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          wget -qO /tmp/intel-gpg.pub \
+            https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          sudo gpg --dearmor -o /usr/share/keyrings/intel-oneapi.gpg /tmp/intel-gpg.pub
+          echo "deb [signed-by=/usr/share/keyrings/intel-oneapi.gpg] \
+            https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
 
-      # ── 7. التقاط المتغيرات لمرة واحدة (The Engineer Way) ─────────
+      # ── 7. Capture oneAPI Environment (THE FIX) ───────────────
+      #
+      #    ROOT CAUSE: setvars.sh calls `exit` (not `return`) when it
+      #    detects SETVARS_COMPLETED is already set. This kills the parent
+      #    shell directly — set +e and || true are both irrelevant because
+      #    the shell process is dead before those operators evaluate.
+      #
+      #    SOLUTION: Source inside a child bash process (bash -c '...').
+      #    The exit 40 terminates the CHILD, not the runner shell.
+      #    We then capture the child's complete environment via `env`,
+      #    diff it against the pre-source snapshot, and write only the
+      #    delta to $GITHUB_ENV using the heredoc multiline syntax.
+      #    This is safe for values containing '=', spaces, and newlines.
+      #
+      #    The grep pattern is intentionally broad to catch ALL vars set
+      #    by setvars.sh: MKL, compiler, MPI, TBB, PATH, LD_LIBRARY_PATH,
+      #    CPATH, PKG_CONFIG_PATH, SETVARS_COMPLETED, etc.
       - name: Capture oneAPI Environment
+        shell: bash
         run: |
-          # استخراج المسارات وحفظها في بيئة GitHub للأبد
-          bash -c "source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1; env" | grep -E "MKLROOT|CPATH|LIBRARY_PATH" >> $GITHUB_ENV
-          # تعريف مسار المكتبات الصريح لاستخدامه في الـ RPATH
-          echo "MKL_LIB_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64" >> $GITHUB_ENV
+          # Snapshot current environment (sorted for stable diff)
+          SNAP_BEFORE=$(mktemp)
+          env | sort > "$SNAP_BEFORE"
+
+          # Source setvars.sh inside an isolated child process.
+          # --force suppresses the "already initialized" guard (exit 40).
+          # We also unset the sentinels for robustness across oneAPI versions.
+          # The child's env is piped back to us as plain text — variables
+          # cross the process boundary as data, not shell state.
+          CHILD_ENV=$(
+            bash --norc --noprofile -c '
+              unset SETVARS_COMPLETED SETVARS_STARTED
+              source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+              env
+            '
+          )
+          CHILD_EXIT=$?
+          # exit 40 from the child is expected on re-runs; treat it as success.
+          if [ $CHILD_EXIT -ne 0 ] && [ $CHILD_EXIT -ne 40 ]; then
+            echo "ERROR: setvars.sh child exited with unexpected code $CHILD_EXIT"
+            exit $CHILD_EXIT
+          fi
+
+          # Write child env to a temp file and diff against pre-source snapshot
+          SNAP_AFTER=$(mktemp)
+          echo "$CHILD_ENV" | sort > "$SNAP_AFTER"
+
+          # comm -13: lines only in AFTER (new or changed vars from setvars.sh)
+          comm -13 "$SNAP_BEFORE" "$SNAP_AFTER" | while IFS= read -r LINE; do
+            KEY="${LINE%%=*}"
+            VALUE="${LINE#*=}"
+
+            # Skip bash internals that are process-specific and would corrupt
+            # the runner environment if injected.
+            case "$KEY" in
+              BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD|SNAP_*|CHILD_*) continue ;;
+            esac
+
+            # GitHub Actions multiline env var syntax (heredoc delimiter).
+            # Safe for values containing '=', quotes, and whitespace.
+            printf '%s<<%s\n%s\n%s\n' \
+              "$KEY" "__ONEAPI_DELIM__" "$VALUE" "__ONEAPI_DELIM__" \
+              >> "$GITHUB_ENV"
+          done
+
+          rm -f "$SNAP_BEFORE" "$SNAP_AFTER"
+
+          # Derive MKL_LIB_PATH dynamically from MKLROOT (set by setvars.sh).
+          # This avoids hardcoding the intel64/ia32 architecture suffix.
+          MKL_ROOT_VAL=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)
+          if [ -n "$MKL_ROOT_VAL" ]; then
+            MKL_LIB=$(find "$MKL_ROOT_VAL/lib" -maxdepth 1 -type d \
+              \( -name "intel64" -o -name "x86_64" \) 2>/dev/null | head -1)
+            [ -n "$MKL_LIB" ] && echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
+          fi
+
+          echo "oneAPI environment captured successfully."
 
       # ── 8. Install Python packages ─────────────────────────────
       - name: Install Python packages
@@ -78,55 +164,72 @@ jobs:
         run: |
           gcc autotuner/autotune.c -I. -O3 -march=core-avx2 -fopenmp -o autotune -lm
           ./autotune
-          read BEST_MC BEST_NC BEST_KC BEST_PA1 BEST_PB1 BEST_PA2 BEST_PB2 < /tmp/autotune_result.txt
-          echo "BEST_MC=$BEST_MC" >> $GITHUB_ENV
-          echo "BEST_NC=$BEST_NC" >> $GITHUB_ENV
-          echo "BEST_KC=$BEST_KC" >> $GITHUB_ENV
+          read BEST_MC BEST_NC BEST_KC BEST_PA1 BEST_PB1 BEST_PA2 BEST_PB2 \
+            < /tmp/autotune_result.txt
+          echo "BEST_MC=$BEST_MC"   >> $GITHUB_ENV
+          echo "BEST_NC=$BEST_NC"   >> $GITHUB_ENV
+          echo "BEST_KC=$BEST_KC"   >> $GITHUB_ENV
           echo "BEST_PA1=$BEST_PA1" >> $GITHUB_ENV
           echo "BEST_PB1=$BEST_PB1" >> $GITHUB_ENV
           echo "BEST_PA2=$BEST_PA2" >> $GITHUB_ENV
           echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
 
-      # ── 10. الـ Compilation باستخدام الـ RPATH (الحل الجذري) ──────
+      # ── 10. Compile matmul binaries ────────────────────────────
+      #    -Wl,-rpath embeds the MKL lib path into the ELF binary so it
+      #    finds libmkl_rt.so at runtime without needing LD_LIBRARY_PATH.
+      #    This is the correct fix for "library not found" at run time.
       - name: Compile matmul binaries
         run: |
-          # التعديل هنا: إضافة -Wl,-rpath لحقن المسار داخل الـ Binary
-          COMMON_FLAGS="-g -fopenmp -O3 -march=core-avx2 -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 -I$MKLROOT/include -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH -lmkl_rt -ldnnl"
-          
-          # بناء النسخة القياسية
+          COMMON_FLAGS="\
+            -g -fopenmp -O3 -march=core-avx2 \
+            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
+            -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
+            -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
+            -I$MKLROOT/include \
+            -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH \
+            -lmkl_rt -ldnnl"
+
+          # Standard kernel
           gcc src/matmul.c $COMMON_FLAGS -o matmul
-          
-          # بناء النسخة الـ Robust باستخدام الـ 242 سطر
+
+          # Robust kernel (swap header, compile, restore)
           mv src/kernel.h src/kernel_std.h
           cp src/kernel_robust.h src/kernel.h
           gcc src/matmul.c $COMMON_FLAGS -o matmul_robust
           mv src/kernel_std.h src/kernel.h
 
-      # ── 11. تشغيل الـ Benchmarks (مباشرة وبأمان) ────────────────
+      # ── 11. Run matmul benchmarks ──────────────────────────────
       - name: Run matmul benchmarks
         run: |
-          # الـ Binary دلوقتي "عارف" طريقه ومحتاج بس الـ Threads
           export OMP_NUM_THREADS=$NCORES
-          
-          ./matmul > standard_output.txt
+          ./matmul       > standard_output.txt
           mv benchmark_results.csv standard_results.csv
-          
           ./matmul_robust > robust_output.txt
           mv benchmark_results.csv robust_results.csv
 
-      # ── 12. Google Benchmark ──────────────────────────────────
+      # ── 12. Google Benchmark ───────────────────────────────────
       - name: Run Google Benchmark
         run: |
-          g++ -O3 -march=core-avx2 -fopenmp benchmarks/google_benchmark.cpp -o google_bench \
-            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC -I./src -I$MKLROOT/include \
-            -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH -lbenchmark -ldnnl -lpthread -lm
-          ./google_bench --benchmark_out=google_results.json --benchmark_out_format=json \
+          g++ -O3 -march=core-avx2 -fopenmp \
+            benchmarks/google_benchmark.cpp -o google_bench \
+            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
+            -I./src -I$MKLROOT/include \
+            -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH \
+            -lbenchmark -ldnnl -lpthread -lm
+          ./google_bench \
+            --benchmark_out=google_results.json \
+            --benchmark_out_format=json \
             --benchmark_filter="BM_MyKernel|BM_OneDNN|BM_ExtremeRange_Accuracy"
 
-      # ── 13. Profiling & Plots ──────────────────────────────────
+      # ── 13. Profiling and Plots ────────────────────────────────
+      #    perf stat may produce limited hardware counter data inside a VM
+      #    (GitHub Actions runners are virtualized). The 2>/dev/null
+      #    redirect prevents perf warnings from failing the step.
+      #    We use || true so a perf failure doesn't abort the workflow —
+      #    plots and CSV results are more valuable than perf output.
       - name: Profile and Plot
         run: |
-          perf stat ./matmul 2>&1 | tee perf_report.txt
+          perf stat ./matmul > perf_report.txt 2>&1 || true
           export CPU_MODEL="${{ env.CPU_MODEL }}"
           python3 scripts/plot.py
           python3 scripts/plot_google.py
@@ -143,3 +246,5 @@ jobs:
             performance_plot.png
             google_bench_plot.png
             perf_report.txt
+            standard_output.txt
+            robust_output.txt

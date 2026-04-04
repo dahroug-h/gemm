@@ -78,19 +78,25 @@ jobs:
           echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
 
       # ── 9. Compile Both Kernels (Standard & Robust) ────────────
+# ── 9. Compile Both Kernels (Standard & Robust) ────────────
       - name: Compile matmul binaries
         run: |
-          echo "--- DEBUG: Sourcing OneAPI (Subshell Mode) ---"
-          (source /opt/intel/oneapi/setvars.sh --force) || echo "Source returned $? (Code 40 is common, ignoring)"
+          # 1. بنوقف الـ "Exit on Error" عشان كود 40 ميموتش الخطوة
+          set +e 
+          source /opt/intel/oneapi/setvars.sh --force
+          set -e # بنرجعه تاني فوراً عشان الأمان
           
-          # 1. Compile Standard version
+          # تأكيد يدوي للمسارات (Double Check)
+          export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
+          
+          # بناء النسخة الـ Standard
           gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
             -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
             -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
             -I$MKLROOT/include -L$MKLROOT/lib/intel64 -lmkl_rt -ldnnl -o matmul
           
-          # 2. Compile Robust version using the "Swap Trick"
+          # بناء النسخة الـ Robust باستخدام الـ 242 سطر
           mv src/kernel.h src/kernel_std.h
           cp src/kernel_robust.h src/kernel.h
           gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \

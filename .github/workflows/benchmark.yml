@@ -13,11 +13,9 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ── 2. Cache apt packages ──────────────────────────────────
       - name: Cache apt packages
         uses: actions/cache@v4
         with:
@@ -25,7 +23,6 @@ jobs:
           key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/benchmark.yml') }}
           restore-keys: apt-${{ runner.os }}-
 
-      # ── 3. Cache Intel MKL ─────────────────────────────────────
       - name: Cache Intel MKL
         id: cache-mkl
         uses: actions/cache@v4
@@ -34,14 +31,12 @@ jobs:
           key: mkl-oneapi-ubuntu22-2025
           restore-keys: mkl-oneapi-ubuntu22-
 
-      # ── 4. Detect CPU and Set Env ──────────────────────────────
       - name: Print CPU info and Setup Environment
         run: |
           CPU_NAME=$(lscpu | grep "Model name" | cut -d':' -f2 | xargs)
           echo "CPU_MODEL=$CPU_NAME" >> $GITHUB_ENV
           echo "NCORES=$(nproc)"     >> $GITHUB_ENV
 
-      # ── 5. Install system dependencies ────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -56,7 +51,6 @@ jobs:
           sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
 
-      # ── 6. Install Intel MKL (skipped if cached) ───────────────
       - name: Install Intel MKL
         if: steps.cache-mkl.outputs.cache-hit != 'true'
         run: |
@@ -69,7 +63,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
 
-      # ── 7. Capture oneAPI Environment ──────────────────────────
       - name: Capture oneAPI Environment
         shell: bash
         run: |
@@ -88,7 +81,7 @@ jobs:
           )
           CHILD_EXIT=$?
           if [ $CHILD_EXIT -ne 0 ]; then
-            echo "ERROR: setvars.sh failed with exit code $CHILD_EXIT"
+            echo "ERROR: setvars.sh failed: $CHILD_EXIT"
             echo "$CHILD_ENV"
             exit $CHILD_EXIT
           fi
@@ -101,8 +94,6 @@ jobs:
             VALUE="${LINE#*=}"
             case "$KEY" in
               BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD|TERM|HOME) continue ;;
-              # Skip LD_LIBRARY_PATH — binaries use -Wl,-rpath instead.
-              # Keeping it causes MKL sub-scripts to retrigger setvars.sh.
               LD_LIBRARY_PATH|LIBRARY_PATH) continue ;;
             esac
             printf '%s<<%s\n%s\n%s\n' \
@@ -112,34 +103,16 @@ jobs:
 
           rm -f "$SNAP_BEFORE" "$SNAP_AFTER"
 
-          # Derive MKL_LIB_PATH from the lib dir that actually contains
-          # libmkl_rt.so — search by the .so file itself, not by dir name.
-          # This is immune to intel64 vs x86_64 naming differences.
           MKL_ROOT_VAL=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)
-          if [ -n "$MKL_ROOT_VAL" ]; then
-            MKL_SO=$(find "$MKL_ROOT_VAL" -name "libmkl_rt.so" 2>/dev/null | head -1)
-            if [ -n "$MKL_SO" ]; then
-              MKL_LIB=$(dirname "$MKL_SO")
-              echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
-              echo "Found libmkl_rt.so at: $MKL_SO"
-            else
-              echo "ERROR: libmkl_rt.so not found under $MKL_ROOT_VAL"
-              find "$MKL_ROOT_VAL" -name "*.so" 2>/dev/null | head -20
-              exit 1
-            fi
-          else
-            echo "ERROR: MKLROOT not set in child environment"
-            exit 1
-          fi
+          MKL_SO=$(find "$MKL_ROOT_VAL" -name "libmkl_rt.so" 2>/dev/null | head -1)
+          MKL_LIB=$(dirname "$MKL_SO")
+          echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
+          echo "SETVARS_COMPLETED=1"    >> "$GITHUB_ENV"
+          echo "Capture done. MKLROOT=$MKL_ROOT_VAL  MKL_LIB=$MKL_LIB"
 
-          echo "SETVARS_COMPLETED=1" >> "$GITHUB_ENV"
-          echo "Capture complete. MKLROOT=$MKL_ROOT_VAL  MKL_LIB=$MKL_LIB"
-
-      # ── 8. Install Python packages ─────────────────────────────
       - name: Install Python packages
         run: pip3 install matplotlib numpy pandas
 
-      # ── 9. Build and Run Autotuner ─────────────────────────────
       - name: Run autotuner
         run: |
           gcc autotuner/autotune.c -I. -O3 -march=core-avx2 -fopenmp -o autotune -lm
@@ -154,71 +127,97 @@ jobs:
           echo "BEST_PA2=$BEST_PA2" >> $GITHUB_ENV
           echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
 
-      # ── 10. Compile matmul binaries ────────────────────────────
-      - name: Compile matmul binaries
+      # ── Compile + Run in ONE step ──────────────────────────────
+      # Merging compile and run into a single step eliminates the
+      # inter-step environment injection that was re-triggering
+      # setvars.sh. Within one step, we control the shell completely.
+      #
+      # Linking strategy: static MKL via the Intel-provided
+      # link-line helper script. Static linking means the binary
+      # has ZERO runtime dependency on the oneAPI directory tree —
+      # no dynamic linker event can spawn a shell that touches
+      # setvars.sh. -lmkl_rt (dynamic) is replaced with the
+      # full static group: -lmkl_intel_lp64 -lmkl_gnu_thread
+      # -lmkl_core wrapped in --start-group/--end-group.
+      # We also wrap the entire run in a clean env that strips
+      # all oneAPI vars so even if something does spawn a shell,
+      # there is nothing to trigger.
+      - name: Compile and Run All Benchmarks
+        shell: bash
         run: |
-          # Verify MKL_LIB_PATH is populated before attempting to compile
-          echo "MKLROOT=$MKLROOT"
-          echo "MKL_LIB_PATH=$MKL_LIB_PATH"
-          ls "$MKL_LIB_PATH/libmkl_rt.so" || { echo "libmkl_rt.so missing!"; exit 1; }
+          set -euo pipefail
 
-          COMMON_FLAGS="\
-            -g -fopenmp -O3 -march=core-avx2 \
-            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
+          MKL_LIB="$MKL_LIB_PATH"
+          MKL_INC="$MKLROOT/include"
+
+          echo "=== Verifying MKL static libs ==="
+          ls "$MKL_LIB"/libmkl_intel_lp64.a \
+             "$MKL_LIB"/libmkl_gnu_thread.a  \
+             "$MKL_LIB"/libmkl_core.a
+
+          DEFINES="-DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
             -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
-            -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
-            -I$MKLROOT/include \
-            -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH \
-            -lmkl_rt -ldnnl"
+            -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2"
 
+          # Static MKL link group — no dynamic MKL dep at all
+          MKL_STATIC="-L$MKL_LIB \
+            -Wl,--start-group \
+              $MKL_LIB/libmkl_intel_lp64.a \
+              $MKL_LIB/libmkl_gnu_thread.a  \
+              $MKL_LIB/libmkl_core.a        \
+            -Wl,--end-group"
+
+          COMMON_FLAGS="-g -fopenmp -O3 -march=core-avx2 \
+            $DEFINES -I$MKL_INC $MKL_STATIC -ldnnl -lm -lpthread"
+
+          echo "=== Compiling standard kernel ==="
           gcc src/matmul.c $COMMON_FLAGS -o matmul
 
+          echo "=== Compiling robust kernel ==="
           mv src/kernel.h src/kernel_std.h
           cp src/kernel_robust.h src/kernel.h
           gcc src/matmul.c $COMMON_FLAGS -o matmul_robust
           mv src/kernel_std.h src/kernel.h
 
-      # ── 11. Run matmul benchmarks ──────────────────────────────
-      - name: Run matmul benchmarks
-        env:
-          SETVARS_COMPLETED: "1"
-        run: |
-          unset LD_LIBRARY_PATH LIBRARY_PATH
-          export OMP_NUM_THREADS=$NCORES
-          ./matmul        > standard_output.txt
-          mv benchmark_results.csv standard_results.csv
-          ./matmul_robust > robust_output.txt
-          mv benchmark_results.csv robust_results.csv
-
-      # ── 12. Google Benchmark ───────────────────────────────────
-      - name: Run Google Benchmark
-        env:
-          SETVARS_COMPLETED: "1"
-        run: |
-          unset LD_LIBRARY_PATH LIBRARY_PATH
+          echo "=== Compiling Google Benchmark ==="
           g++ -O3 -march=core-avx2 -fopenmp \
             benchmarks/google_benchmark.cpp -o google_bench \
-            -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
-            -I./src -I$MKLROOT/include \
-            -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH \
+            $DEFINES -I./src -I$MKL_INC $MKL_STATIC \
             -lbenchmark -ldnnl -lpthread -lm
-          ./google_bench \
-            --benchmark_out=google_results.json \
-            --benchmark_out_format=json \
-            --benchmark_filter="BM_MyKernel|BM_OneDNN|BM_ExtremeRange_Accuracy"
 
-      # ── 13. Profiling and Plots ────────────────────────────────
+          echo "=== Running benchmarks in clean environment ==="
+          # Strip ALL oneAPI vars from the runtime environment.
+          # The static binary needs none of them. This is the
+          # definitive fix — no oneAPI var in env = no trigger.
+          env -i \
+            HOME="$HOME" \
+            PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            OMP_NUM_THREADS="$NCORES" \
+            bash --norc --noprofile -c '
+              set -euo pipefail
+              ./matmul > standard_output.txt
+              mv benchmark_results.csv standard_results.csv
+              ./matmul_robust > robust_output.txt
+              mv benchmark_results.csv robust_results.csv
+              ./google_bench \
+                --benchmark_out=google_results.json \
+                --benchmark_out_format=json \
+                --benchmark_filter="BM_MyKernel|BM_OneDNN|BM_ExtremeRange_Accuracy"
+            '
+
       - name: Profile and Plot
-        env:
-          SETVARS_COMPLETED: "1"
         run: |
-          unset LD_LIBRARY_PATH LIBRARY_PATH
-          perf stat ./matmul > perf_report.txt 2>&1 || true
+          # perf runs in a fresh env too — no oneAPI vars needed for profiling
+          env -i \
+            HOME="$HOME" \
+            PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            bash --norc --noprofile -c '
+              perf stat ./matmul > perf_report.txt 2>&1 || true
+            '
           export CPU_MODEL="${{ env.CPU_MODEL }}"
           python3 scripts/plot.py
           python3 scripts/plot_google.py
 
-      # ── 14. Upload Results ─────────────────────────────────────
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:

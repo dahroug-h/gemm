@@ -2,10 +2,14 @@
 #include "immintrin.h"
 #include <stdlib.h>
 
-// استعملنا _A و _B و _C عشان الـ Compiler ميتلخبطش بين الماكرو والمتغير اللي اسمه A أو B
-#define _A(i,j) A[(i)+(j)*LDA]
-#define _B(i,j) B[(i)+(j)*LDB]
-#define _C(i,j) C[(i)+(j)*LDC]
+/* * ROBUST KERNEL - Numerical Integrity for Full INT8 Range [-128, 127]
+ * Corrects AVX2 16-bit intermediate saturation issues.
+ */
+
+// Macros mapped to renamed arguments to avoid "Shadowing" errors
+#define A(i,j) _arg_A[(i)+(j)*LDA]
+#define B(i,j) _arg_B[(i)+(j)*LDB]
+#define C(i,j) _arg_C[(i)+(j)*LDC]
 
 #ifndef MC
 extern __thread int MC, NC, KC;
@@ -15,13 +19,19 @@ extern __thread int MC, NC, KC;
     #define NTHREADS omp_get_max_threads()
 #endif
 
-#define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(static) num_threads(NTHREADS)")
+#ifndef OMP_SCHEDULE
+    #define OMP_SCHEDULE static
+#endif
 
-// تصحيح الماكرو بتاع الـ min
-#define min_val(a,b) (((a)<(b))?(a):(b))
+#define PRAGMA_OMP_PARALLEL_FOR _Pragma("omp parallel for schedule(OMP_SCHEDULE) num_threads(NTHREADS)")
 
 #define MC_PADDED(mc) (((mc + 5) / 6) * 6)
 #define NC_PADDED(nc) (((nc + 15) / 16) * 16)
+
+// Correcting the implicit declaration warning
+#ifndef min
+    #define min(a,b) (((a)<(b))?(a):(b))
+#endif
 
 #ifndef PREFETCH_A_L1
     #define PREFETCH_A_L1  192
@@ -29,11 +39,19 @@ extern __thread int MC, NC, KC;
 #ifndef PREFETCH_B_L1
     #define PREFETCH_B_L1  256
 #endif
+#ifndef PREFETCH_A_L2
+    #define PREFETCH_A_L2  768
+#endif
+#ifndef PREFETCH_B_L2
+    #define PREFETCH_B_L2  1024
+#endif
 
-// الـ Robust Micro-kernel اللي بيحل مشكلة الـ +-28
+// Robust Micro-kernel: Widens to 32-bit IMMEDIATELY after maddubs
 #define micro_kernel_6x16_robust \
     _mm_prefetch((const char*)(pa + PREFETCH_A_L1), _MM_HINT_T0); \
+    _mm_prefetch((const char*)(pa + PREFETCH_A_L2), _MM_HINT_T1); \
     _mm_prefetch((const char*)(pb + PREFETCH_B_L1), _MM_HINT_T0); \
+    _mm_prefetch((const char*)(pb + PREFETCH_B_L2), _MM_HINT_T1); \
     __m256i b0 = _mm256_load_si256((__m256i*)pb); pb += 32; \
     __m256i b1 = _mm256_load_si256((__m256i*)pb); pb += 32; \
     __m256i ones = _mm256_set1_epi16(1); \
@@ -49,14 +67,13 @@ extern __thread int MC, NC, KC;
         if (r==5) { c10=_mm256_add_epi32(c10,_mm256_madd_epi16(m0,ones)); c11=_mm256_add_epi32(c11,_mm256_madd_epi16(m1,ones)); } \
     } pa += 24; k += 4;
 
-void pack_A(int8_t* __restrict A, int8_t* __restrict Buffer_A, int mc, int kc,
+void pack_A(int8_t* __restrict _arg_A, int8_t* __restrict Buffer_A, int mc, int kc,
             int row_start, int col_start, int LDA)
 {
     for (int i = 0; i < mc; i += 6) {
         int mr = min(6, mc - i);
         int p = 0;
         
-        // PURE SPEED: Fast XOR loop
         for (; p + 3 < kc; p += 4) {
             for (int r = 0; r < mr; r++) {
                 *Buffer_A++ = A(row_start+i+r, col_start+p+0) ^ 0x80;
@@ -69,7 +86,6 @@ void pack_A(int8_t* __restrict A, int8_t* __restrict Buffer_A, int mc, int kc,
             }
         }
         
-        // Fringe loop
         if (p < kc) {
             for (int r = 0; r < mr; r++) {
                 *Buffer_A++ = (p+0<kc) ? (A(row_start+i+r, col_start+p+0) ^ 0x80) : 0x80;
@@ -84,7 +100,7 @@ void pack_A(int8_t* __restrict A, int8_t* __restrict Buffer_A, int mc, int kc,
     }
 }
 
-void pack_B(int8_t* __restrict B, int8_t* __restrict Buffer_B, int nc, int kc,
+void pack_B(int8_t* __restrict _arg_B, int8_t* __restrict Buffer_B, int nc, int kc,
             int col_start, int row_start, int LDB)
 {
     for (int j = 0; j < nc; j += 16) {
@@ -119,7 +135,7 @@ void pack_B(int8_t* __restrict B, int8_t* __restrict Buffer_B, int nc, int kc,
 
 static inline __attribute__((always_inline))
 void macro_kernel(int32_t M, int32_t N, int32_t K,
-                  int8_t* __restrict A, int8_t* __restrict B, int32_t* __restrict C, int LDC)
+                  int8_t* __restrict _arg_A, int8_t* __restrict _arg_B, int32_t* __restrict _arg_C, int LDC)
 {
     int k;
     __m256i ones = _mm256_set1_epi16(1);
@@ -136,15 +152,15 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
     __m256i c10 = _mm256_setzero_si256();
     __m256i c11 = _mm256_setzero_si256();
 
-    int8_t* pa = A;
-    int8_t* pb = B;
+    int8_t* pa = _arg_A;
+    int8_t* pb = _arg_B;
     int K_padded = (K + 3) & ~3;
 
     for (int j = 0; j < 16; j++)
-        _mm_prefetch((const char*)&C[j * LDC], _MM_HINT_T0);
+        _mm_prefetch((const char*)&C(0, j), _MM_HINT_T0);
 
     for (k = 0; k < K_padded; ) {
-        micro_kernel_6x16
+        micro_kernel_6x16_robust
     }
 
     int32_t tmp[6][16] __attribute__((aligned(32)));
@@ -161,15 +177,14 @@ void macro_kernel(int32_t M, int32_t N, int32_t K,
     _mm256_storeu_si256((__m256i*)&tmp[5][0], c10);
     _mm256_storeu_si256((__m256i*)&tmp[5][8], c11);
 
-    // CRITICAL FIX: Loop order swapped to C(r, c) over contiguous memory
     for (int c = 0; c < N; c++)
         for (int r = 0; r < M; r++)
             C(r, c) += tmp[r][c];
 }
 
-void kernel(int32_t M, int32_t N, int32_t K,
-            int8_t* __restrict A, int LDA, int8_t* __restrict B, int LDB,
-            int32_t* __restrict C, int LDC)
+void kernel_robust(int32_t M, int32_t N, int32_t K,
+            int8_t* __restrict _arg_A, int LDA, int8_t* __restrict _arg_B, int LDB,
+            int32_t* __restrict _arg_C, int LDC)
 {
     int32_t* B_col_sum = (int32_t*)malloc(N * sizeof(int32_t));
     if (!B_col_sum) return;
@@ -197,12 +212,12 @@ void kernel(int32_t M, int32_t N, int32_t K,
         int nc = min(N-j, NC);
         for (int p = 0; p < K; p += KC) {
             int kc = min(K-p, KC);
-            pack_B(B, Local_Buffer_B, nc, kc, j, p, LDB); 
+            pack_B(_arg_B, Local_Buffer_B, nc, kc, j, p, LDB); 
             int kc_padded = (kc+3) & ~3;
 
             for (int i = 0; i < M; i += MC) {
                 int mc = min(M-i, MC);
-                pack_A(A, Local_Buffer_A, mc, kc, i, p, LDA);
+                pack_A(_arg_A, Local_Buffer_A, mc, kc, i, p, LDA);
 
                 PRAGMA_OMP_PARALLEL_FOR
                 for (int jr = 0; jr < nc; jr += 16) {
@@ -219,7 +234,6 @@ void kernel(int32_t M, int32_t N, int32_t K,
         }
     }
 
-    // CRITICAL FIX: AVX Vectorized Global Correction
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < N; j++) {
         int32_t corr = B_col_sum[j];

@@ -78,7 +78,10 @@ jobs:
       # ── 9. Compile Both Kernels (Standard & Robust) ────────────
       - name: Compile matmul binaries
         run: |
-          source /opt/intel/oneapi/setvars.sh --force || [[ $? -eq 40 ]]
+          set +e
+          source /opt/intel/oneapi/setvars.sh --force
+          set -e
+          
           # 1. Compile Standard version
           gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
@@ -99,7 +102,10 @@ jobs:
       # ── 10. Run All Benchmarks ─────────────────────────────────
       - name: Run matmul benchmarks
         run: |
-          source /opt/intel/oneapi/setvars.sh --force || [[ $? -eq 40 ]]
+          set +e
+          source /opt/intel/oneapi/setvars.sh --force
+          set -e
+          
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
           export OMP_NUM_THREADS=$NCORES
           
@@ -114,18 +120,23 @@ jobs:
       # ── 11. Google Benchmark (With Robustness Test) ───────────
       - name: Run Google Benchmark
         run: |
-          source /opt/intel/oneapi/setvars.sh --force || [[ $? -eq 40 ]]
+          set +e
+          source /opt/intel/oneapi/setvars.sh --force
+          set -e
+          
           g++ -O3 -march=core-avx2 -fopenmp benchmarks/google_benchmark.cpp -o google_bench \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC -I./src -I$MKLROOT/include \
             -L$MKLROOT/lib/intel64 -lbenchmark -ldnnl -lpthread -lm
-          # Filter ensures we test the extreme range failure zone
           ./google_bench --benchmark_out=google_results.json --benchmark_out_format=json \
             --benchmark_filter="BM_MyKernel|BM_OneDNN|BM_ExtremeRange_Accuracy"
 
       # ── 12. Profiling & Plots ──────────────────────────────────
       - name: Profile and Plot
         run: |
-          source /opt/intel/oneapi/setvars.sh --force || [[ $? -eq 40 ]]
+          set +e
+          source /opt/intel/oneapi/setvars.sh --force
+          set -e
+          
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
           perf stat ./matmul 2>&1 | tee perf_report.txt
           export CPU_MODEL="${{ env.CPU_MODEL }}"

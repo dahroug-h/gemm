@@ -57,13 +57,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
 
-      # ── 7. Setup oneAPI Variables (The Ultimate Fix) ───────────
+      # ── 7. The Ultimate Fix: One-Time Environment Capture ──────
       - name: Setup oneAPI Environment Variables
         run: |
-          # بنشغل السكريبت في Subshell عشان لو انتحر بـ exit 40 ميموتش الـ Runner
-          # وبناخد المتغيرات اللي تهمنا ونرميها في GITHUB_ENV عشان تفضل معانا طول الـ Job
+          # بنشغل السكريبت في Bash منفصل (Subshell) عشان لو انتحر بـ exit 40 ميموتش الـ Runner
+          # بناخد المتغيرات ونرميها في GITHUB_ENV عشان تفضل معانا طول الـ Job
           bash -c "source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1; env" | grep -E "MKLROOT|CPATH|LIBRARY_PATH" >> $GITHUB_ENV
-          # بنضيف الـ Path يدوياً عشان نضمن إن الـ Binaries تتشاف
+          # إضافة يدوية لمسارات المكتبات لضمان عمل الـ Linker
           echo "LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64:/opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64" >> $GITHUB_ENV
 
       # ── 8. Install Python packages ─────────────────────────────
@@ -87,7 +87,7 @@ jobs:
       # ── 10. Compile Both Kernels (Standard & Robust) ───────────
       - name: Compile matmul binaries
         run: |
-          # مفيش سورس تاني خلاص!
+          # مفيش 'source' تاني خلاص، المتغيرات في الـ Environment فعلاً
           
           # 1. Compile Standard version
           gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \

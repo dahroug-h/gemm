@@ -97,16 +97,20 @@ jobs:
           mv src/kernel_std.h src/kernel.h
 
       # ── 10. Run All Benchmarks ─────────────────────────────────
-
       - name: Run matmul benchmarks
-         run: |
+        run: |
           source /opt/intel/oneapi/setvars.sh --force || true
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
+          export OMP_NUM_THREADS=$NCORES
+          
+          # Run Standard
           ./matmul > standard_output.txt
-           mv benchmark_results.csv standard_results.csv
-         ./matmul_robust > robust_output.txt
+          mv benchmark_results.csv standard_results.csv
+          
+          # Run Robust
+          ./matmul_robust > robust_output.txt
           mv benchmark_results.csv robust_results.csv
-      
+
       # ── 11. Google Benchmark (With Robustness Test) ───────────
       - name: Run Google Benchmark
         run: |

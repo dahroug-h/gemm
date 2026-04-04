@@ -68,90 +68,76 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/oneAPI.list
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
-      - name: DEBUG - Find Intel auto-source hooks
-        run: |
-          echo "=== /etc/profile.d/ ==="
-          ls -la /etc/profile.d/
-          echo ""
-          echo "=== /etc/bash.bashrc.d/ (if exists) ==="
-          ls -la /etc/bash.bashrc.d/ 2>/dev/null || echo "directory does not exist"
-          echo ""
-          echo "=== grep setvars.sh across /etc ==="
-          sudo grep -r "setvars" /etc/profile.d/ /etc/bash.bashrc.d/ /etc/bash.bashrc /etc/environment 2>/dev/null || echo "not found in common locations"
-          echo ""
-          echo "=== full /etc/profile.d contents ==="
-          for f in /etc/profile.d/*.sh; do
-            echo "--- $f ---"
-            cat "$f"
-          done
 
-      # ── 7. DEFUSE the auto-source trap, then Capture env ───────
+      # ── 7. Capture oneAPI Environment ──────────────────────────
       #
-      #    ROOT CAUSE OF EXIT 40 IN LATER STEPS:
-      #    intel-oneapi-mkl-devel drops a shell snippet into
-      #    /etc/profile.d/ that calls setvars.sh on every new
-      #    bash shell. GitHub Actions `run:` steps each spawn a
-      #    fresh bash that sources /etc/profile.d/* — so EVERY
-      #    step after install re-triggers setvars.sh, which sees
-      #    SETVARS_COMPLETED=1 in the environment (written by our
-      #    capture step to $GITHUB_ENV) and fires `exit 40`.
+      #    ROOT CAUSE (confirmed by diagnostic):
+      #    No profile.d hook exists — Intel doesn't install one on this
+      #    runner image. The exit 40 comes from setvars.sh itself during
+      #    the child process execution, because `bash --norc --noprofile`
+      #    still INHERITS the parent shell's exported environment. If
+      #    SETVARS_COMPLETED (or any partial oneAPI var) is already
+      #    exported in the parent (e.g. from a prior cache-restored run
+      #    or a GitHub Actions env injection), setvars.sh sees it and
+      #    calls `exit 40` even though we pass --force, because in
+      #    oneAPI 2025.x the sub-scripts (mkl/env/vars.sh, etc.) each
+      #    have their own `exit` guard that --force does not suppress.
       #
-      #    FIX IN TWO PARTS:
-      #    1. Rename every profile.d/bashrc.d snippet Intel dropped
-      #       so no future shell ever auto-sources setvars.sh.
-      #    2. Source setvars.sh exactly once inside an isolated
-      #       child bash. Capture its env delta. Write to GITHUB_ENV.
-      #       All subsequent steps inherit vars from the env file —
-      #       no sourcing ever happens again.
-      - name: Defuse oneAPI auto-source and capture environment
+      #    FIX: Use `env -i` to launch the child with a completely blank
+      #    environment — zero inherited vars. We reconstruct only the
+      #    minimal env needed for bash and setvars.sh to function:
+      #      HOME, PATH (system only), TERM.
+      #    setvars.sh then sees no sentinels whatsoever and runs cleanly.
+      #    We capture its output env, diff against the real parent env,
+      #    and write only new/changed vars to $GITHUB_ENV.
+      - name: Capture oneAPI Environment
         shell: bash
         run: |
-          # ── Part 1: Defuse all auto-source hooks ──────────────
-          for f in \
-            /etc/profile.d/oneapi-vars.sh \
-            /etc/profile.d/intel-oneapi.sh \
-            /etc/bash.bashrc.d/oneapi-vars.sh \
-            /etc/bash.bashrc.d/intel-oneapi.sh
-          do
-            if [ -f "$f" ]; then
-              echo "Disabling: $f"
-              sudo mv "$f" "${f}.disabled"
-            fi
-          done
-
-          # Belt-and-suspenders: catch any other file referencing setvars.sh
-          for f in /etc/profile.d/*.sh; do
-            if grep -q "setvars.sh" "$f" 2>/dev/null; then
-              echo "Disabling unexpected hook: $f"
-              sudo mv "$f" "${f}.disabled"
-            fi
-          done
-
-          # ── Part 2: Source once in an isolated child ──────────
+          # Snapshot the REAL parent environment before any sourcing
           SNAP_BEFORE=$(mktemp)
           env | sort > "$SNAP_BEFORE"
 
+          # Launch child with a completely blank environment via env -i.
+          # Only inject the bare minimum for bash + setvars.sh to work:
+          #   HOME        — setvars.sh reads this for user config paths
+          #   PATH        — system PATH only, no Intel paths yet
+          #   TERM        — prevents tput warnings in sub-scripts
+          # Every oneAPI sentinel (SETVARS_COMPLETED, SETVARS_STARTED,
+          # MKLROOT, etc.) is absent because we start from zero.
           CHILD_ENV=$(
-            bash --norc --noprofile -c '
-              unset SETVARS_COMPLETED SETVARS_STARTED
-              source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
-              env
-            '
+            env -i \
+              HOME="$HOME" \
+              PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+              TERM="${TERM:-dumb}" \
+              bash --norc --noprofile -c '
+                source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+                env
+              '
           )
           CHILD_EXIT=$?
-          if [ $CHILD_EXIT -ne 0 ] && [ $CHILD_EXIT -ne 40 ]; then
-            echo "ERROR: setvars.sh exited with unexpected code $CHILD_EXIT"
+
+          # Any non-zero exit here is a genuine failure — with env -i and
+          # no sentinels present, setvars.sh has no reason to exit 40.
+          if [ $CHILD_EXIT -ne 0 ]; then
+            echo "ERROR: setvars.sh failed with exit code $CHILD_EXIT"
+            echo "--- child env output (for debugging) ---"
+            echo "$CHILD_ENV"
             exit $CHILD_EXIT
           fi
 
+          # Write child env to temp file for diffing
           SNAP_AFTER=$(mktemp)
           echo "$CHILD_ENV" | sort > "$SNAP_AFTER"
 
+          # comm -13: lines ONLY in AFTER = vars added/changed by setvars.sh
+          # Write each to $GITHUB_ENV using heredoc multiline syntax —
+          # the only form safe for values containing '=' (like PATH=a:b:c).
           comm -13 "$SNAP_BEFORE" "$SNAP_AFTER" | while IFS= read -r LINE; do
             KEY="${LINE%%=*}"
             VALUE="${LINE#*=}"
+            # Skip bash process internals that are child-specific
             case "$KEY" in
-              BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD) continue ;;
+              BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD|TERM|HOME) continue ;;
             esac
             printf '%s<<%s\n%s\n%s\n' \
               "$KEY" "__ONEAPI_DELIM__" "$VALUE" "__ONEAPI_DELIM__" \
@@ -160,7 +146,8 @@ jobs:
 
           rm -f "$SNAP_BEFORE" "$SNAP_AFTER"
 
-          # Derive MKL_LIB_PATH dynamically from MKLROOT
+          # Derive MKL_LIB_PATH dynamically from MKLROOT so we never
+          # hardcode the intel64/x86_64 architecture suffix.
           MKL_ROOT_VAL=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)
           if [ -n "$MKL_ROOT_VAL" ]; then
             MKL_LIB=$(find "$MKL_ROOT_VAL/lib" -maxdepth 1 -type d \
@@ -168,7 +155,8 @@ jobs:
             [ -n "$MKL_LIB" ] && echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
           fi
 
-          echo "Done. oneAPI environment captured, auto-source hooks disabled."
+          echo "oneAPI environment captured successfully."
+          echo "MKLROOT=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)"
 
       # ── 8. Install Python packages ─────────────────────────────
       - name: Install Python packages

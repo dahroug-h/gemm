@@ -68,6 +68,22 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/oneAPI.list
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
+          - name: DEBUG - Find Intel auto-source hooks
+        run: |
+          echo "=== /etc/profile.d/ ==="
+          ls -la /etc/profile.d/
+          echo ""
+          echo "=== /etc/bash.bashrc.d/ (if exists) ==="
+          ls -la /etc/bash.bashrc.d/ 2>/dev/null || echo "directory does not exist"
+          echo ""
+          echo "=== grep setvars.sh across /etc ==="
+          sudo grep -r "setvars" /etc/profile.d/ /etc/bash.bashrc.d/ /etc/bash.bashrc /etc/environment 2>/dev/null || echo "not found in common locations"
+          echo ""
+          echo "=== full /etc/profile.d contents ==="
+          for f in /etc/profile.d/*.sh; do
+            echo "--- $f ---"
+            cat "$f"
+          done
 
       # ── 7. DEFUSE the auto-source trap, then Capture env ───────
       #

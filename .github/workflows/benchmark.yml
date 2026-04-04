@@ -42,11 +42,6 @@ jobs:
           echo "NCORES=$(nproc)"     >> $GITHUB_ENV
 
       # ── 5. Install system dependencies ────────────────────────
-      #    NOTE: perf requires the exact running kernel's tools package.
-      #    On GitHub Actions the kernel version changes per runner image,
-      #    so we install linux-tools-generic as a reliable fallback and
-      #    symlink /usr/bin/perf to it. Hardware counters may be limited
-      #    inside the VM but perf stat will still run.
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -54,7 +49,6 @@ jobs:
             gcc g++ libgomp1 python3-pip \
             libdnnl-dev libbenchmark-dev \
             linux-tools-common linux-tools-generic
-          # Make 'perf' resolvable regardless of exact kernel version
           if ! command -v perf &>/dev/null; then
             PERF_BIN=$(find /usr/lib/linux-tools -name perf 2>/dev/null | head -1)
             [ -n "$PERF_BIN" ] && sudo ln -sf "$PERF_BIN" /usr/local/bin/perf
@@ -63,8 +57,6 @@ jobs:
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
 
       # ── 6. Install Intel MKL (skipped if cached) ───────────────
-      #    Uses the modern signed-by keyring method (apt-key is deprecated
-      #    on Ubuntu 22.04 and prints warnings that pollute logs).
       - name: Install Intel MKL
         if: steps.cache-mkl.outputs.cache-hit != 'true'
         run: |
@@ -77,35 +69,52 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
 
-      # ── 7. Capture oneAPI Environment (THE FIX) ───────────────
+      # ── 7. DEFUSE the auto-source trap, then Capture env ───────
       #
-      #    ROOT CAUSE: setvars.sh calls `exit` (not `return`) when it
-      #    detects SETVARS_COMPLETED is already set. This kills the parent
-      #    shell directly — set +e and || true are both irrelevant because
-      #    the shell process is dead before those operators evaluate.
+      #    ROOT CAUSE OF EXIT 40 IN LATER STEPS:
+      #    intel-oneapi-mkl-devel drops a shell snippet into
+      #    /etc/profile.d/ that calls setvars.sh on every new
+      #    bash shell. GitHub Actions `run:` steps each spawn a
+      #    fresh bash that sources /etc/profile.d/* — so EVERY
+      #    step after install re-triggers setvars.sh, which sees
+      #    SETVARS_COMPLETED=1 in the environment (written by our
+      #    capture step to $GITHUB_ENV) and fires `exit 40`.
       #
-      #    SOLUTION: Source inside a child bash process (bash -c '...').
-      #    The exit 40 terminates the CHILD, not the runner shell.
-      #    We then capture the child's complete environment via `env`,
-      #    diff it against the pre-source snapshot, and write only the
-      #    delta to $GITHUB_ENV using the heredoc multiline syntax.
-      #    This is safe for values containing '=', spaces, and newlines.
-      #
-      #    The grep pattern is intentionally broad to catch ALL vars set
-      #    by setvars.sh: MKL, compiler, MPI, TBB, PATH, LD_LIBRARY_PATH,
-      #    CPATH, PKG_CONFIG_PATH, SETVARS_COMPLETED, etc.
-      - name: Capture oneAPI Environment
+      #    FIX IN TWO PARTS:
+      #    1. Rename every profile.d/bashrc.d snippet Intel dropped
+      #       so no future shell ever auto-sources setvars.sh.
+      #    2. Source setvars.sh exactly once inside an isolated
+      #       child bash. Capture its env delta. Write to GITHUB_ENV.
+      #       All subsequent steps inherit vars from the env file —
+      #       no sourcing ever happens again.
+      - name: Defuse oneAPI auto-source and capture environment
         shell: bash
         run: |
-          # Snapshot current environment (sorted for stable diff)
+          # ── Part 1: Defuse all auto-source hooks ──────────────
+          for f in \
+            /etc/profile.d/oneapi-vars.sh \
+            /etc/profile.d/intel-oneapi.sh \
+            /etc/bash.bashrc.d/oneapi-vars.sh \
+            /etc/bash.bashrc.d/intel-oneapi.sh
+          do
+            if [ -f "$f" ]; then
+              echo "Disabling: $f"
+              sudo mv "$f" "${f}.disabled"
+            fi
+          done
+
+          # Belt-and-suspenders: catch any other file referencing setvars.sh
+          for f in /etc/profile.d/*.sh; do
+            if grep -q "setvars.sh" "$f" 2>/dev/null; then
+              echo "Disabling unexpected hook: $f"
+              sudo mv "$f" "${f}.disabled"
+            fi
+          done
+
+          # ── Part 2: Source once in an isolated child ──────────
           SNAP_BEFORE=$(mktemp)
           env | sort > "$SNAP_BEFORE"
 
-          # Source setvars.sh inside an isolated child process.
-          # --force suppresses the "already initialized" guard (exit 40).
-          # We also unset the sentinels for robustness across oneAPI versions.
-          # The child's env is piped back to us as plain text — variables
-          # cross the process boundary as data, not shell state.
           CHILD_ENV=$(
             bash --norc --noprofile -c '
               unset SETVARS_COMPLETED SETVARS_STARTED
@@ -114,29 +123,20 @@ jobs:
             '
           )
           CHILD_EXIT=$?
-          # exit 40 from the child is expected on re-runs; treat it as success.
           if [ $CHILD_EXIT -ne 0 ] && [ $CHILD_EXIT -ne 40 ]; then
-            echo "ERROR: setvars.sh child exited with unexpected code $CHILD_EXIT"
+            echo "ERROR: setvars.sh exited with unexpected code $CHILD_EXIT"
             exit $CHILD_EXIT
           fi
 
-          # Write child env to a temp file and diff against pre-source snapshot
           SNAP_AFTER=$(mktemp)
           echo "$CHILD_ENV" | sort > "$SNAP_AFTER"
 
-          # comm -13: lines only in AFTER (new or changed vars from setvars.sh)
           comm -13 "$SNAP_BEFORE" "$SNAP_AFTER" | while IFS= read -r LINE; do
             KEY="${LINE%%=*}"
             VALUE="${LINE#*=}"
-
-            # Skip bash internals that are process-specific and would corrupt
-            # the runner environment if injected.
             case "$KEY" in
-              BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD|SNAP_*|CHILD_*) continue ;;
+              BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD) continue ;;
             esac
-
-            # GitHub Actions multiline env var syntax (heredoc delimiter).
-            # Safe for values containing '=', quotes, and whitespace.
             printf '%s<<%s\n%s\n%s\n' \
               "$KEY" "__ONEAPI_DELIM__" "$VALUE" "__ONEAPI_DELIM__" \
               >> "$GITHUB_ENV"
@@ -144,8 +144,7 @@ jobs:
 
           rm -f "$SNAP_BEFORE" "$SNAP_AFTER"
 
-          # Derive MKL_LIB_PATH dynamically from MKLROOT (set by setvars.sh).
-          # This avoids hardcoding the intel64/ia32 architecture suffix.
+          # Derive MKL_LIB_PATH dynamically from MKLROOT
           MKL_ROOT_VAL=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)
           if [ -n "$MKL_ROOT_VAL" ]; then
             MKL_LIB=$(find "$MKL_ROOT_VAL/lib" -maxdepth 1 -type d \
@@ -153,7 +152,7 @@ jobs:
             [ -n "$MKL_LIB" ] && echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
           fi
 
-          echo "oneAPI environment captured successfully."
+          echo "Done. oneAPI environment captured, auto-source hooks disabled."
 
       # ── 8. Install Python packages ─────────────────────────────
       - name: Install Python packages
@@ -175,9 +174,6 @@ jobs:
           echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
 
       # ── 10. Compile matmul binaries ────────────────────────────
-      #    -Wl,-rpath embeds the MKL lib path into the ELF binary so it
-      #    finds libmkl_rt.so at runtime without needing LD_LIBRARY_PATH.
-      #    This is the correct fix for "library not found" at run time.
       - name: Compile matmul binaries
         run: |
           COMMON_FLAGS="\
@@ -189,10 +185,8 @@ jobs:
             -L$MKL_LIB_PATH -Wl,-rpath,$MKL_LIB_PATH \
             -lmkl_rt -ldnnl"
 
-          # Standard kernel
           gcc src/matmul.c $COMMON_FLAGS -o matmul
 
-          # Robust kernel (swap header, compile, restore)
           mv src/kernel.h src/kernel_std.h
           cp src/kernel_robust.h src/kernel.h
           gcc src/matmul.c $COMMON_FLAGS -o matmul_robust
@@ -202,7 +196,7 @@ jobs:
       - name: Run matmul benchmarks
         run: |
           export OMP_NUM_THREADS=$NCORES
-          ./matmul       > standard_output.txt
+          ./matmul        > standard_output.txt
           mv benchmark_results.csv standard_results.csv
           ./matmul_robust > robust_output.txt
           mv benchmark_results.csv robust_results.csv
@@ -222,11 +216,6 @@ jobs:
             --benchmark_filter="BM_MyKernel|BM_OneDNN|BM_ExtremeRange_Accuracy"
 
       # ── 13. Profiling and Plots ────────────────────────────────
-      #    perf stat may produce limited hardware counter data inside a VM
-      #    (GitHub Actions runners are virtualized). The 2>/dev/null
-      #    redirect prevents perf warnings from failing the step.
-      #    We use || true so a perf failure doesn't abort the workflow —
-      #    plots and CSV results are more valuable than perf output.
       - name: Profile and Plot
         run: |
           perf stat ./matmul > perf_report.txt 2>&1 || true

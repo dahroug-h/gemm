@@ -57,14 +57,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y intel-oneapi-mkl-devel
 
-      # ── 7. The Ultimate Fix: One-Time Environment Capture ──────
-      - name: Setup oneAPI Environment Variables
+      # ── 7. تثبيت بيئة oneAPI (الحل الجذري والنهائي) ──────────────
+      - name: Setup and Persist oneAPI Environment
         run: |
-          # بنشغل السكريبت في Bash منفصل (Subshell) عشان لو انتحر بـ exit 40 ميموتش الـ Runner
-          # بناخد المتغيرات ونرميها في GITHUB_ENV عشان تفضل معانا طول الـ Job
+          # نستخدم Bash منفصل لاستخراج المتغيرات لضمان عدم تأثر الـ Runner لو حدث exit 40
+          # نقوم بحفظ المتغيرات الأساسية في GITHUB_ENV لتصبح متاحة في كل الخطوات التالية تلقائياً
           bash -c "source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1; env" | grep -E "MKLROOT|CPATH|LIBRARY_PATH" >> $GITHUB_ENV
-          # إضافة يدوية لمسارات المكتبات لضمان عمل الـ Linker
-          echo "LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64:/opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64" >> $GITHUB_ENV
+          
+          # إضافة يدوية لمسارات المكتبات لضمان عمل الـ Dynamic Linker وقت التشغيل
+          echo "LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64:/opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       # ── 8. Install Python packages ─────────────────────────────
       - name: Install Python packages
@@ -84,19 +85,19 @@ jobs:
           echo "BEST_PA2=$BEST_PA2" >> $GITHUB_ENV
           echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
 
-      # ── 10. Compile Both Kernels (Standard & Robust) ───────────
+      # ── 10. بناء الأنوية (Standard & Robust) ────────────────────
       - name: Compile matmul binaries
         run: |
-          # مفيش 'source' تاني خلاص، المتغيرات في الـ Environment فعلاً
+          # لا حاجة لـ source هنا! المتغيرات محملة بالفعل في البيئة
           
-          # 1. Compile Standard version
+          # 1. بناء النسخة القياسية
           gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
             -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
             -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2 \
             -I$MKLROOT/include -L$MKLROOT/lib/intel64 -lmkl_rt -ldnnl -o matmul
           
-          # 2. Compile Robust version using the "Swap Trick"
+          # 2. بناء النسخة الـ Robust باستخدام الـ 242 سطر
           mv src/kernel.h src/kernel_std.h
           cp src/kernel_robust.h src/kernel.h
           gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \
@@ -106,19 +107,19 @@ jobs:
             -I$MKLROOT/include -L$MKLROOT/lib/intel64 -lmkl_rt -ldnnl -o matmul_robust
           mv src/kernel_std.h src/kernel.h
 
-      # ── 11. Run All Benchmarks ─────────────────────────────────
+      # ── 11. تشغيل الاختبارات ───────────────────────────────────
       - name: Run matmul benchmarks
         run: |
           export OMP_NUM_THREADS=$NCORES
-          # Run Standard
+          # تشغيل النسخة القياسية
           ./matmul > standard_output.txt
           mv benchmark_results.csv standard_results.csv
           
-          # Run Robust
+          # تشغيل النسخة الـ Robust
           ./matmul_robust > robust_output.txt
           mv benchmark_results.csv robust_results.csv
 
-      # ── 12. Google Benchmark (With Robustness Test) ───────────
+      # ── 12. Google Benchmark (اختبار الدقة) ────────────────────
       - name: Run Google Benchmark
         run: |
           g++ -O3 -march=core-avx2 -fopenmp benchmarks/google_benchmark.cpp -o google_bench \
@@ -127,7 +128,7 @@ jobs:
           ./google_bench --benchmark_out=google_results.json --benchmark_out_format=json \
             --benchmark_filter="BM_MyKernel|BM_OneDNN|BM_ExtremeRange_Accuracy"
 
-      # ── 13. Profiling & Plots ──────────────────────────────────
+      # ── 13. التوصيف والرسوم البيانية ────────────────────────────
       - name: Profile and Plot
         run: |
           perf stat ./matmul 2>&1 | tee perf_report.txt
@@ -135,7 +136,7 @@ jobs:
           python3 scripts/plot.py
           python3 scripts/plot_google.py
 
-      # ── 14. Upload All Artifacts ───────────────────────────────
+      # ── 14. رفع النتائج ────────────────────────────────────────
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:

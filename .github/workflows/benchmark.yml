@@ -37,6 +37,8 @@ jobs:
           CPU_NAME=$(lscpu | grep "Model name" | cut -d':' -f2 | xargs)
           echo "CPU_MODEL=$CPU_NAME" >> $GITHUB_ENV
           echo "NCORES=$(nproc)" >> $GITHUB_ENV
+          echo "--- DEBUG: Initial Env Check ---"
+          env | grep -E "MKLROOT|ONEAPI|SETVARS" || echo "Clean Environment"
 
       # ── 5. Install system dependencies + perf tools ───────────
       - name: Install system dependencies
@@ -78,9 +80,8 @@ jobs:
       # ── 9. Compile Both Kernels (Standard & Robust) ────────────
       - name: Compile matmul binaries
         run: |
-          set +e
-          source /opt/intel/oneapi/setvars.sh --force
-          set -e
+          echo "--- DEBUG: Sourcing OneAPI (Subshell Mode) ---"
+          (source /opt/intel/oneapi/setvars.sh --force) || echo "Source returned $? (Code 40 is common, ignoring)"
           
           # 1. Compile Standard version
           gcc -g -fopenmp src/matmul.c -O3 -march=core-avx2 \
@@ -102,11 +103,9 @@ jobs:
       # ── 10. Run All Benchmarks ─────────────────────────────────
       - name: Run matmul benchmarks
         run: |
-          set +e
-          source /opt/intel/oneapi/setvars.sh --force
-          set -e
-          
+          echo "--- DEBUG: Checking MKL Path before Execution ---"
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
+          echo "LD_LIBRARY_PATH is: $LD_LIBRARY_PATH"
           export OMP_NUM_THREADS=$NCORES
           
           # Run Standard
@@ -120,10 +119,7 @@ jobs:
       # ── 11. Google Benchmark (With Robustness Test) ───────────
       - name: Run Google Benchmark
         run: |
-          set +e
-          source /opt/intel/oneapi/setvars.sh --force
-          set -e
-          
+          (source /opt/intel/oneapi/setvars.sh --force) || true
           g++ -O3 -march=core-avx2 -fopenmp benchmarks/google_benchmark.cpp -o google_bench \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC -I./src -I$MKLROOT/include \
             -L$MKLROOT/lib/intel64 -lbenchmark -ldnnl -lpthread -lm
@@ -133,10 +129,7 @@ jobs:
       # ── 12. Profiling & Plots ──────────────────────────────────
       - name: Profile and Plot
         run: |
-          set +e
-          source /opt/intel/oneapi/setvars.sh --force
-          set -e
-          
+          # نكتفي بالمتغيرات المحملة مسبقاً
           export LD_LIBRARY_PATH=$MKLROOT/lib/intel64:$LD_LIBRARY_PATH
           perf stat ./matmul 2>&1 | tee perf_report.txt
           export CPU_MODEL="${{ env.CPU_MODEL }}"

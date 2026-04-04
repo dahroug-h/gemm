@@ -70,19 +70,6 @@ jobs:
           sudo apt-get install -y intel-oneapi-mkl-devel
 
       # ── 7. Capture oneAPI Environment ──────────────────────────
-      #
-      #    env -i gives the child a fully blank environment so
-      #    setvars.sh sees zero sentinels and runs cleanly.
-      #    We then diff the child env against the parent snapshot
-      #    and persist only the delta to $GITHUB_ENV.
-      #
-      #    IMPORTANT: we do NOT persist LD_LIBRARY_PATH into
-      #    GITHUB_ENV. Our binaries embed the MKL rpath via
-      #    -Wl,-rpath at compile time, so LD_LIBRARY_PATH is
-      #    redundant for runtime — and keeping it causes MKL's
-      #    own shell-init hooks to fire when any subprocess is
-      #    spawned, retriggering exit 40 in later steps.
-      #    MKLROOT + the compile-time rpath is all we need.
       - name: Capture oneAPI Environment
         shell: bash
         run: |
@@ -113,13 +100,9 @@ jobs:
             KEY="${LINE%%=*}"
             VALUE="${LINE#*=}"
             case "$KEY" in
-              # Skip child-specific bash internals
               BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD|TERM|HOME) continue ;;
-              # CRITICAL: Do NOT export LD_LIBRARY_PATH or LIBRARY_PATH.
-              # Binaries use -Wl,-rpath so these are not needed at runtime.
-              # Exporting them causes MKL sub-scripts to be sourced by any
-              # child process that inspects its own library environment,
-              # which re-triggers setvars.sh and produces exit 40.
+              # Skip LD_LIBRARY_PATH — binaries use -Wl,-rpath instead.
+              # Keeping it causes MKL sub-scripts to retrigger setvars.sh.
               LD_LIBRARY_PATH|LIBRARY_PATH) continue ;;
             esac
             printf '%s<<%s\n%s\n%s\n' \
@@ -129,22 +112,28 @@ jobs:
 
           rm -f "$SNAP_BEFORE" "$SNAP_AFTER"
 
-          # Derive MKL_LIB_PATH from MKLROOT for use in -L and -rpath flags
+          # Derive MKL_LIB_PATH from the lib dir that actually contains
+          # libmkl_rt.so — search by the .so file itself, not by dir name.
+          # This is immune to intel64 vs x86_64 naming differences.
           MKL_ROOT_VAL=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)
           if [ -n "$MKL_ROOT_VAL" ]; then
-            MKL_LIB=$(find "$MKL_ROOT_VAL/lib" -maxdepth 1 -type d \
-              \( -name "intel64" -o -name "x86_64" \) 2>/dev/null | head -1)
-            [ -n "$MKL_LIB" ] && echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
+            MKL_SO=$(find "$MKL_ROOT_VAL" -name "libmkl_rt.so" 2>/dev/null | head -1)
+            if [ -n "$MKL_SO" ]; then
+              MKL_LIB=$(dirname "$MKL_SO")
+              echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
+              echo "Found libmkl_rt.so at: $MKL_SO"
+            else
+              echo "ERROR: libmkl_rt.so not found under $MKL_ROOT_VAL"
+              find "$MKL_ROOT_VAL" -name "*.so" 2>/dev/null | head -20
+              exit 1
+            fi
+          else
+            echo "ERROR: MKLROOT not set in child environment"
+            exit 1
           fi
 
-          # Also set SETVARS_COMPLETED so any accidental future source
-          # of setvars.sh returns immediately via `return` (not exit).
-          # We set it here explicitly so it is in the parent env —
-          # if setvars.sh ever does get sourced again it will hit the
-          # `return 0` path, not the `exit 40` path.
           echo "SETVARS_COMPLETED=1" >> "$GITHUB_ENV"
-
-          echo "oneAPI environment captured. MKLROOT=$MKL_ROOT_VAL"
+          echo "Capture complete. MKLROOT=$MKL_ROOT_VAL  MKL_LIB=$MKL_LIB"
 
       # ── 8. Install Python packages ─────────────────────────────
       - name: Install Python packages
@@ -168,6 +157,11 @@ jobs:
       # ── 10. Compile matmul binaries ────────────────────────────
       - name: Compile matmul binaries
         run: |
+          # Verify MKL_LIB_PATH is populated before attempting to compile
+          echo "MKLROOT=$MKLROOT"
+          echo "MKL_LIB_PATH=$MKL_LIB_PATH"
+          ls "$MKL_LIB_PATH/libmkl_rt.so" || { echo "libmkl_rt.so missing!"; exit 1; }
+
           COMMON_FLAGS="\
             -g -fopenmp -O3 -march=core-avx2 \
             -DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
@@ -185,14 +179,6 @@ jobs:
           mv src/kernel_std.h src/kernel.h
 
       # ── 11. Run matmul benchmarks ──────────────────────────────
-      #
-      #    We explicitly unset LD_LIBRARY_PATH and LIBRARY_PATH here
-      #    as a belt-and-suspenders measure. The -Wl,-rpath baked into
-      #    the binary handles runtime linking. Unsetting these vars
-      #    ensures no MKL sub-script can be triggered by the dynamic
-      #    linker or by libmkl_rt's internal init routines.
-      #    SETVARS_COMPLETED=1 is also set to make any accidental
-      #    setvars.sh invocation take the safe `return` path.
       - name: Run matmul benchmarks
         env:
           SETVARS_COMPLETED: "1"
